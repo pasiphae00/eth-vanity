@@ -11,6 +11,8 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -43,10 +45,11 @@ func main() {
 	defer stop()
 
 	var attempts uint64
+	feed := NewLiveFeed(cfg.Threads)
 	progressCtx, stopProgress := context.WithCancel(ctx)
-	go reportProgress(progressCtx, &attempts)
+	go reportProgress(progressCtx, &attempts, feed)
 
-	result, err := Search(ctx, criteria, cfg.Threads, &attempts)
+	result, err := Search(ctx, criteria, cfg.Threads, &attempts, feed)
 	stopProgress()
 	fmt.Fprintln(os.Stderr)
 
@@ -82,8 +85,9 @@ func parseFlags() *config {
 	flag.StringVar(&cfg.Suffix, "s", "", "short for -suffix")
 	flag.StringVar(&cfg.Output, "output", ".", "directory to save the encrypted keystore file")
 	flag.StringVar(&cfg.Output, "o", ".", "short for -output")
-	flag.IntVar(&cfg.Threads, "threads", 50, "number of concurrent goroutines searching for a match")
-	flag.IntVar(&cfg.Threads, "t", 50, "short for -threads")
+	defaultThreads := runtime.NumCPU()
+	flag.IntVar(&cfg.Threads, "threads", defaultThreads, "number of concurrent goroutines searching for a match")
+	flag.IntVar(&cfg.Threads, "t", defaultThreads, "short for -threads")
 
 	flag.Usage = usage
 	flag.Parse()
@@ -177,24 +181,62 @@ func printSearchInfo(c MatchCriteria, threads int) {
 	}
 }
 
-func reportProgress(ctx context.Context, attempts *uint64) {
-	ticker := time.NewTicker(time.Second)
+var spinnerFrames = []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
+
+// reportProgress redraws a single status line ~10x/sec: a spinner, the most
+// recently generated (and almost certainly discarded) candidate address
+// flickering by, and running attempt/rate stats.
+func reportProgress(ctx context.Context, attempts *uint64, feed *LiveFeed) {
+	const frameInterval = 100 * time.Millisecond
+	ticker := time.NewTicker(frameInterval)
 	defer ticker.Stop()
 
 	start := time.Now()
-	var last uint64
-	for {
+	rateWindowStart := start
+	var rateWindowAttempts uint64
+	var rate float64
+
+	for frame := 0; ; frame++ {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
 			total := atomic.LoadUint64(attempts)
-			rate := total - last
-			last = total
+			if elapsed := now.Sub(rateWindowStart); elapsed >= time.Second {
+				rate = float64(total-rateWindowAttempts) / elapsed.Seconds()
+				rateWindowAttempts = total
+				rateWindowStart = now
+			}
+
+			addr := feed.Sample(frame)
+			if addr == "" {
+				addr = strings.Repeat("·", 40)
+			}
+			spin := spinnerFrames[frame%len(spinnerFrames)]
 			elapsed := now.Sub(start).Round(time.Second)
-			fmt.Fprintf(os.Stderr, "\rsearched %d addresses (%d/s, %s elapsed)   ", total, rate, elapsed)
+
+			fmt.Fprintf(os.Stderr, "\r%c 0x%s   %s tried   %s/s   %s   ",
+				spin, addr, commify(total), commify(uint64(rate)), elapsed)
 		}
 	}
+}
+
+// commify inserts thousands separators, e.g. 1234567 -> "1,234,567".
+func commify(n uint64) string {
+	s := strconv.FormatUint(n, 10)
+	if len(s) <= 3 {
+		return s
+	}
+	lead := len(s) % 3
+	if lead == 0 {
+		lead = 3
+	}
+	out := []byte(s[:lead])
+	for i := lead; i < len(s); i += 3 {
+		out = append(out, ',')
+		out = append(out, s[i:i+3]...)
+	}
+	return string(out)
 }
 
 func usage() {
@@ -208,7 +250,7 @@ Flags:
   -p, --prefix string   hex bytes required at the start of the address (no "0x" needed)
   -s, --suffix string   hex bytes required at the end of the address
   -o, --output string   directory to save the encrypted keystore file (default ".")
-  -t, --threads int     number of concurrent goroutines searching for a match (default 50)
+  -t, --threads int     number of concurrent goroutines searching for a match (default: number of CPUs)
   -h, --help             show this help message
 
 Notes:
@@ -219,9 +261,12 @@ Notes:
   - Once a matching address is found, you'll be prompted (with confirmation) for a
     passphrase to encrypt the keystore — there's no flag for this, so it never ends up
     in shell history or process listings.
+  - This is CPU-bound work; going far past --threads = number of CPUs usually doesn't
+    help and can even slow things down. Benchmark a few values around your core count
+    if you want to squeeze out more throughput.
 
 Examples:
   eth-vanity --prefix 0000 --suffix 666
-  eth-vanity -p dead -o ./keys -t 100
+  eth-vanity -p dead -o ./keys
 `)
 }

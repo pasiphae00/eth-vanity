@@ -162,6 +162,13 @@ func searchWorker(ctx context.Context, criteria MatchCriteria, prefix, suffix []
 	zs := make([]secp256k1.FieldVal, batchSize)
 	zInv := make([]secp256k1.FieldVal, batchSize)
 
+	// pub and hash are reused across every candidate rather than declared
+	// fresh each iteration: passing a slice into hasher's interface methods
+	// (Write/Read) defeats escape analysis, so a freshly-declared array would
+	// otherwise heap-allocate on every single call.
+	var pub [64]byte
+	var hash [32]byte
+
 	// totalOffset is the number of point additions applied to cur since it
 	// started at k0*G; it persists across batches (unlike a per-batch
 	// counter) because it's what lets us recover the actual private key
@@ -193,13 +200,9 @@ func searchWorker(ctx context.Context, criteria MatchCriteria, prefix, suffix []
 			ax.Mul2(&xs[i], &zInv2).Normalize()
 			ay.Mul2(&ys[i], &zInv3).Normalize()
 
-			var pub [64]byte
-			xb := ax.Bytes()
-			yb := ay.Bytes()
-			copy(pub[:32], xb[:])
-			copy(pub[32:], yb[:])
+			ax.PutBytesUnchecked(pub[:32])
+			ay.PutBytesUnchecked(pub[32:])
 
-			var hash [32]byte
 			hasher.Reset()
 			hasher.Write(pub[:])
 			hasher.Read(hash[:])

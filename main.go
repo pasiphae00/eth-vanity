@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"math"
@@ -29,6 +30,14 @@ type config struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "create2" {
+		runCreate2(os.Args[2:])
+		return
+	}
+	runWallet()
+}
+
+func runWallet() {
 	cfg := parseFlags()
 
 	if err := validate(cfg); err != nil {
@@ -95,17 +104,9 @@ func parseFlags() *config {
 }
 
 func validate(cfg *config) error {
-	prefix := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(cfg.Prefix, "0x"), "0X"))
-	suffix := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(cfg.Suffix, "0x"), "0X"))
-
-	if !isHex(prefix) {
-		return fmt.Errorf("--prefix %q is not valid hex (allowed characters: 0-9, a-f, A-F)", cfg.Prefix)
-	}
-	if !isHex(suffix) {
-		return fmt.Errorf("--suffix %q is not valid hex (allowed characters: 0-9, a-f, A-F)", cfg.Suffix)
-	}
-	if len(prefix)+len(suffix) > 40 {
-		return fmt.Errorf("combined --prefix and --suffix length (%d) exceeds address length (40 hex chars)", len(prefix)+len(suffix))
+	prefix, suffix, err := validateVanityBytes(cfg.Prefix, cfg.Suffix)
+	if err != nil {
+		return err
 	}
 	if cfg.Threads < 1 {
 		return fmt.Errorf("--threads must be at least 1, got %d", cfg.Threads)
@@ -119,6 +120,11 @@ func validate(cfg *config) error {
 	return nil
 }
 
+// normalizeHex lowercases s and strips an optional "0x"/"0X" prefix.
+func normalizeHex(s string) string {
+	return strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(s, "0x"), "0X"))
+}
+
 func isHex(s string) bool {
 	for _, r := range s {
 		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
@@ -126,6 +132,49 @@ func isHex(s string) bool {
 		}
 	}
 	return true
+}
+
+// validateVanityBytes normalizes and validates a --prefix/--suffix pair
+// against the shape of a 20-byte Ethereum address. Shared by both the
+// wallet and create2 subcommands, since both search for an address match.
+func validateVanityBytes(prefixRaw, suffixRaw string) (prefix, suffix string, err error) {
+	prefix = normalizeHex(prefixRaw)
+	suffix = normalizeHex(suffixRaw)
+
+	if !isHex(prefix) {
+		return "", "", fmt.Errorf("--prefix %q is not valid hex (allowed characters: 0-9, a-f, A-F)", prefixRaw)
+	}
+	if !isHex(suffix) {
+		return "", "", fmt.Errorf("--suffix %q is not valid hex (allowed characters: 0-9, a-f, A-F)", suffixRaw)
+	}
+	if len(prefix)+len(suffix) > 40 {
+		return "", "", fmt.Errorf("combined --prefix and --suffix length (%d) exceeds address length (40 hex chars)", len(prefix)+len(suffix))
+	}
+	return prefix, suffix, nil
+}
+
+// parseHexFixed strips an optional "0x"/"0X" prefix from s and decodes it as
+// exactly n bytes of hex.
+func parseHexFixed(s string, n int) ([]byte, error) {
+	s = normalizeHex(s)
+	if len(s) != n*2 {
+		return nil, fmt.Errorf("expected %d hex characters, got %d", n*2, len(s))
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("invalid hex: %w", err)
+	}
+	return b, nil
+}
+
+// hexDecodeFlexible strips an optional "0x"/"0X" prefix from s and decodes
+// the rest as hex, whatever its length.
+func hexDecodeFlexible(s string) ([]byte, error) {
+	b, err := hex.DecodeString(normalizeHex(s))
+	if err != nil {
+		return nil, fmt.Errorf("invalid hex: %w", err)
+	}
+	return b, nil
 }
 
 // readPassphrase prompts for a passphrase twice (without echoing input) and
@@ -268,5 +317,9 @@ Notes:
 Examples:
   eth-vanity --prefix 0000 --suffix 666
   eth-vanity -p dead -o ./keys
+
+Subcommands:
+  create2   mine a salt for a vanity CREATE2 contract address instead of a
+            wallet (see 'eth-vanity create2 --help')
 `)
 }

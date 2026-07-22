@@ -44,7 +44,7 @@ func runCreate2(args []string) {
 	var attempts uint64
 	feed := NewLiveFeed(cfg.Threads)
 	progressCtx, stopProgress := context.WithCancel(ctx)
-	go reportProgress(progressCtx, &attempts, feed)
+	go reportProgress(progressCtx, &attempts, feed, len(criteria.Prefix)+len(criteria.Suffix))
 
 	result, err := SearchCreate2(ctx, deployer, initCodeHash, criteria, cfg.Threads, &attempts, feed)
 	stopProgress()

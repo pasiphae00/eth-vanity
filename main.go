@@ -56,7 +56,7 @@ func runWallet() {
 	var attempts uint64
 	feed := NewLiveFeed(cfg.Threads)
 	progressCtx, stopProgress := context.WithCancel(ctx)
-	go reportProgress(progressCtx, &attempts, feed)
+	go reportProgress(progressCtx, &attempts, feed, len(criteria.Prefix)+len(criteria.Suffix))
 
 	result, err := Search(ctx, criteria, cfg.Threads, &attempts, feed)
 	stopProgress()
@@ -234,8 +234,12 @@ var spinnerFrames = []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧
 
 // reportProgress redraws a single status line ~10x/sec: a spinner, the most
 // recently generated (and almost certainly discarded) candidate address
-// flickering by, and running attempt/rate stats.
-func reportProgress(ctx context.Context, attempts *uint64, feed *LiveFeed) {
+// flickering by, and running attempt/rate stats. Once the hash rate has a
+// first real reading, it also prints a one-time estimated-time-to-match
+// range (not a countdown) derived from the search space size and that
+// rate; combined is the total vanity byte length (0 to skip the estimate,
+// e.g. a random account with no prefix/suffix).
+func reportProgress(ctx context.Context, attempts *uint64, feed *LiveFeed, combined int) {
 	const frameInterval = 100 * time.Millisecond
 	ticker := time.NewTicker(frameInterval)
 	defer ticker.Stop()
@@ -244,6 +248,7 @@ func reportProgress(ctx context.Context, attempts *uint64, feed *LiveFeed) {
 	rateWindowStart := start
 	var rateWindowAttempts uint64
 	var rate float64
+	estimatePrinted := combined == 0
 
 	for frame := 0; ; frame++ {
 		select {
@@ -255,6 +260,11 @@ func reportProgress(ctx context.Context, attempts *uint64, feed *LiveFeed) {
 				rate = float64(total-rateWindowAttempts) / elapsed.Seconds()
 				rateWindowAttempts = total
 				rateWindowStart = now
+
+				if !estimatePrinted && rate > 0 {
+					fmt.Fprintf(os.Stderr, "\r%s\n", estimateTimeToMatch(combined, rate))
+					estimatePrinted = true
+				}
 			}
 
 			addr := feed.Sample(frame)
@@ -268,6 +278,61 @@ func reportProgress(ctx context.Context, attempts *uint64, feed *LiveFeed) {
 				spin, addr, commify(total), commify(uint64(rate)), elapsed)
 		}
 	}
+}
+
+// estimateTimeToMatch computes a one-standard-deviation range for how long
+// finding a match should take, given the search space size (16^combined
+// candidates, each an independent 1-in-N chance) and the current hash
+// rate. Match count follows a geometric distribution, whose standard
+// deviation is very close to its own mean whenever the match probability
+// is small (as it always is here) -- so this range is naturally wide, and
+// its low end is naturally close to "could happen immediately". That's an
+// inherent property of these odds, not an approximation error.
+func estimateTimeToMatch(combined int, rate float64) string {
+	p := 1 / math.Pow(16, float64(combined))
+	mean := 1 / p
+	stddev := math.Sqrt((1 - p) / (p * p))
+
+	lowAttempts := mean - stddev
+	if lowAttempts < 0 {
+		lowAttempts = 0
+	}
+	highAttempts := mean + stddev
+
+	return fmt.Sprintf("Est. time to match (1σ range): %s", formatDurationRange(lowAttempts/rate, highAttempts/rate))
+}
+
+// formatDurationRange formats two second counts as a range sharing a single
+// human-scaled unit chosen from the larger (high) value, e.g. "6.2-12.4h".
+func formatDurationRange(lowSeconds, highSeconds float64) string {
+	units := []struct {
+		secs  float64
+		label string
+	}{
+		{1, "s"},
+		{60, "m"},
+		{3600, "h"},
+		{86400, "d"},
+		{86400 * 365.25, "y"},
+	}
+	unit := units[0]
+	for _, u := range units {
+		if highSeconds >= u.secs {
+			unit = u
+		}
+	}
+
+	return fmt.Sprintf("%s-%s%s", formatNum(lowSeconds/unit.secs), formatNum(highSeconds/unit.secs), unit.label)
+}
+
+func formatNum(v float64) string {
+	if v >= 10 {
+		return fmt.Sprintf("%.0f", v)
+	}
+	s := fmt.Sprintf("%.1f", v)
+	s = strings.TrimSuffix(s, "0")
+	s = strings.TrimSuffix(s, ".")
+	return s
 }
 
 // commify inserts thousands separators, e.g. 1234567 -> "1,234,567".

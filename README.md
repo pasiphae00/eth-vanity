@@ -1,6 +1,8 @@
 # eth-vanity-rs
 
-A Rust reimplementation of [`eth-vanity`](../eth-vanity), built to benchmark against it. Same feature set: generate an Ethereum keypair matching a `--prefix`/`--suffix` (saved as a geth-compatible encrypted keystore), or mine a `create2` salt for a vanity contract address.
+A Rust reimplementation of [`eth-vanity`](https://codeberg.org/pasiphae/eth-vanity), built to benchmark against it. 
+
+It has the same feature set and usage: generate an Ethereum keypair matching a `--prefix`/`--suffix` (saved as a geth-compatible encrypted keystore), or mine a `create2` salt for a vanity contract address.
 
 ## Build
 

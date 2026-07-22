@@ -145,12 +145,13 @@ fn run_wallet(
     let attempts = AtomicU64::new(0);
     let feed = LiveFeed::new(threads);
 
+    let combined = criteria.prefix.len() + criteria.suffix.len();
     let progress_running = Arc::new(AtomicBool::new(true));
     let attempts_ref = &attempts;
     let feed_ref = &feed;
     let result = std::thread::scope(|scope| {
         let pr = progress_running.clone();
-        scope.spawn(move || progress::report_progress(attempts_ref, feed_ref, &pr));
+        scope.spawn(move || progress::report_progress(attempts_ref, feed_ref, &pr, combined));
 
         let result = search::search(&criteria, threads, attempts_ref, Some(feed_ref), &running);
         progress_running.store(false, Ordering::Relaxed);
@@ -239,12 +240,13 @@ fn run_create2(
     let attempts = AtomicU64::new(0);
     let feed = LiveFeed::new(threads);
 
+    let combined = criteria.prefix.len() + criteria.suffix.len();
     let progress_running = Arc::new(AtomicBool::new(true));
     let attempts_ref = &attempts;
     let feed_ref = &feed;
     let result = std::thread::scope(|scope| {
         let pr = progress_running.clone();
-        scope.spawn(move || progress::report_progress(attempts_ref, feed_ref, &pr));
+        scope.spawn(move || progress::report_progress(attempts_ref, feed_ref, &pr, combined));
 
         let result = create2::search(
             &deployer_arr,

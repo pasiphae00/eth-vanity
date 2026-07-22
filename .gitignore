@@ -1,2 +1,4 @@
 /eth-vanity
 *.exe
+*.env
+.env*

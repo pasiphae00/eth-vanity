@@ -85,17 +85,47 @@ func generatorPoint() secp256k1.JacobianPoint {
 
 // randomScalar draws a uniformly random, non-zero scalar in [1, N-1] using
 // rejection sampling, matching the rigor of crypto/ecdsa's key generation.
-func randomScalar() (secp256k1.ModNScalar, error) {
-	var buf [32]byte
+//
+// If externalEntropy is non-nil (an --extra-entropy fetch succeeded), each
+// draw is additionally mixed with it via mixEntropy before being
+// interpreted as a scalar. Local OS randomness is always drawn fresh on
+// every attempt regardless; externalEntropy only ever supplements it, so a
+// doctored or absent external source can never make this weaker than local
+// randomness alone -- only fail to add anything.
+func randomScalar(externalEntropy []byte, worker int) (secp256k1.ModNScalar, error) {
+	var local [32]byte
 	var scalar secp256k1.ModNScalar
 	for {
-		if _, err := cryptorand.Read(buf[:]); err != nil {
+		if _, err := cryptorand.Read(local[:]); err != nil {
 			return scalar, err
 		}
-		if scalar.SetBytes(&buf) == 0 && !scalar.IsZero() {
+
+		seed := local
+		if externalEntropy != nil {
+			seed = mixEntropy(local, externalEntropy, worker)
+		}
+
+		if scalar.SetBytes(&seed) == 0 && !scalar.IsZero() {
 			return scalar, nil
 		}
 	}
+}
+
+// mixEntropy combines fresh local randomness with a shared external
+// randomness source into a single 32-byte seed via Keccak256. Hashing
+// preserves the local input's full entropy regardless of the quality of
+// externalEntropy (even all-zero or attacker-chosen bytes), so this can
+// only add security, never remove it. worker differentiates otherwise
+// identical externalEntropy across concurrent workers, though each
+// worker's fresh local component already ensures independence on its own.
+func mixEntropy(local [32]byte, externalEntropy []byte, worker int) [32]byte {
+	var workerBytes [8]byte
+	binary.BigEndian.PutUint64(workerBytes[:], uint64(worker))
+
+	digest := crypto.Keccak256(local[:], externalEntropy, workerBytes[:])
+	var seed [32]byte
+	copy(seed[:], digest)
+	return seed
 }
 
 // scalarFromUint64 encodes n as a ModNScalar. n is always well within the
@@ -145,8 +175,8 @@ func batchInvert(zs, out []secp256k1.FieldVal) {
 // structure in its input, the resulting addresses are indistinguishable from
 // independently sampled ones for search purposes. This is the same
 // technique used by other vanity-address generators (e.g. profanity).
-func searchWorker(ctx context.Context, criteria MatchCriteria, prefix, suffix []byte, attempts *uint64, feed *LiveFeed, worker int) (*SearchResult, error) {
-	k0, err := randomScalar()
+func searchWorker(ctx context.Context, criteria MatchCriteria, prefix, suffix []byte, attempts *uint64, feed *LiveFeed, worker int, externalEntropy []byte) (*SearchResult, error) {
+	k0, err := randomScalar(externalEntropy, worker)
 	if err != nil {
 		return nil, err
 	}
@@ -239,8 +269,9 @@ func searchWorker(ctx context.Context, criteria MatchCriteria, prefix, suffix []
 // candidate keys (see searchWorker) until one matches criteria or ctx is
 // cancelled. attempts is incremented as batches complete, so callers can
 // report progress from another goroutine. feed may be nil if the caller
-// doesn't want live candidate updates.
-func Search(ctx context.Context, criteria MatchCriteria, threads int, attempts *uint64, feed *LiveFeed) (*SearchResult, error) {
+// doesn't want live candidate updates. externalEntropy may be nil to use
+// local OS randomness only (see randomScalar).
+func Search(ctx context.Context, criteria MatchCriteria, threads int, attempts *uint64, feed *LiveFeed, externalEntropy []byte) (*SearchResult, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -258,7 +289,7 @@ func Search(ctx context.Context, criteria MatchCriteria, threads int, attempts *
 	for i := 0; i < threads; i++ {
 		go func(worker int) {
 			defer wg.Done()
-			result, err := searchWorker(ctx, criteria, prefix, suffix, attempts, feed, worker)
+			result, err := searchWorker(ctx, criteria, prefix, suffix, attempts, feed, worker, externalEntropy)
 			if err != nil {
 				return
 			}

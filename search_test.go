@@ -98,7 +98,7 @@ func TestSearchWorkerAddressesMatchReference(t *testing.T) {
 	const testBatchSize = 8
 	const numBatches = 5
 
-	k0, err := randomScalar()
+	k0, err := randomScalar(nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestSearchEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	result, err := Search(ctx, criteria, 4, &attempts, nil)
+	result, err := Search(ctx, criteria, 4, &attempts, nil, nil)
 	if err != nil {
 		t.Fatalf("Search failed: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestSearchManyEndToEnd(t *testing.T) {
 		criteria := MatchCriteria{Suffix: "0"}
 		var attempts uint64
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		result, err := Search(ctx, criteria, 8, &attempts, nil)
+		result, err := Search(ctx, criteria, 8, &attempts, nil, nil)
 		cancel()
 		if err != nil {
 			t.Fatalf("run %d: Search failed: %v", i, err)

@@ -23,10 +23,11 @@ import (
 )
 
 type config struct {
-	Prefix  string
-	Suffix  string
-	Output  string
-	Threads int
+	Prefix       string
+	Suffix       string
+	Output       string
+	Threads      int
+	ExtraEntropy bool
 }
 
 func main() {
@@ -48,6 +49,24 @@ func runWallet() {
 	}
 
 	criteria := MatchCriteria{Prefix: cfg.Prefix, Suffix: cfg.Suffix}
+
+	var externalEntropy []byte
+	if cfg.ExtraEntropy {
+		source := "random.org (free legacy endpoint)"
+		if strings.TrimSpace(os.Getenv(randomOrgAPIKeyEnv)) != "" {
+			source = "random.org (authenticated API)"
+		}
+		fmt.Fprintf(os.Stderr, "Fetching additional entropy from %s...\n", source)
+
+		entropy, err := fetchExternalEntropy()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not fetch additional entropy (%v); continuing with OS randomness only.\n", err)
+		} else {
+			externalEntropy = entropy
+			fmt.Fprintln(os.Stderr, "Mixing in additional entropy from random.org.")
+		}
+	}
+
 	printSearchInfo(criteria, cfg.Threads)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -58,7 +77,7 @@ func runWallet() {
 	progressCtx, stopProgress := context.WithCancel(ctx)
 	go reportProgress(progressCtx, &attempts, feed, len(criteria.Prefix)+len(criteria.Suffix))
 
-	result, err := Search(ctx, criteria, cfg.Threads, &attempts, feed)
+	result, err := Search(ctx, criteria, cfg.Threads, &attempts, feed, externalEntropy)
 	stopProgress()
 	fmt.Fprintln(os.Stderr)
 
@@ -97,6 +116,8 @@ func parseFlags() *config {
 	defaultThreads := runtime.NumCPU()
 	flag.IntVar(&cfg.Threads, "threads", defaultThreads, "number of concurrent goroutines searching for a match")
 	flag.IntVar(&cfg.Threads, "t", defaultThreads, "short for -threads")
+	flag.BoolVar(&cfg.ExtraEntropy, "extra-entropy", false, "mix in additional randomness fetched from random.org (supplements, never replaces, local OS randomness)")
+	flag.BoolVar(&cfg.ExtraEntropy, "e", false, "short for -extra-entropy")
 
 	flag.Usage = usage
 	flag.Parse()
@@ -366,11 +387,12 @@ Usage:
   eth-vanity [flags]
 
 Flags:
-  -p, --prefix string   hex bytes required at the start of the address (no "0x" needed)
-  -s, --suffix string   hex bytes required at the end of the address
-  -o, --output string   directory to save the encrypted keystore file (default ".")
-  -t, --threads int     number of concurrent goroutines searching for a match (default: number of CPUs)
-  -h, --help             show this help message
+  -p, --prefix string    hex bytes required at the start of the address (no "0x" needed)
+  -s, --suffix string    hex bytes required at the end of the address
+  -o, --output string    directory to save the encrypted keystore file (default ".")
+  -t, --threads int      number of concurrent goroutines searching for a match (default: number of CPUs)
+  -e, --extra-entropy    mix in additional randomness from random.org (see Notes)
+  -h, --help              show this help message
 
 Notes:
   - --prefix and --suffix accept only hex characters (0-9, a-f, A-F) and are matched
@@ -383,10 +405,18 @@ Notes:
   - This is CPU-bound work; going far past --threads = number of CPUs usually doesn't
     help and can even slow things down. Benchmark a few values around your core count
     if you want to squeeze out more throughput.
+  - --extra-entropy fetches randomness from random.org and mixes it (via Keccak256)
+    into each thread's local OS randomness before deriving its starting key — it
+    supplements local randomness, never replaces it, so a doctored or unreachable
+    random.org can only fail to help, never make key generation weaker. Fetch
+    failures fall back to OS randomness only, with a warning. Set RANDOM_ORG_API_KEY
+    in the environment to use random.org's authenticated API (separate quota from
+    the free endpoint); otherwise the free, unauthenticated legacy endpoint is used.
 
 Examples:
   eth-vanity --prefix 0000 --suffix 666
   eth-vanity -p dead -o ./keys
+  eth-vanity -p cafe --extra-entropy
 
 Subcommands:
   create2   mine a salt for a vanity CREATE2 contract address instead of a

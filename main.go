@@ -262,7 +262,7 @@ func reportProgress(ctx context.Context, attempts *uint64, feed *LiveFeed, combi
 				rateWindowStart = now
 
 				if !estimatePrinted && rate > 0 {
-					fmt.Fprintf(os.Stderr, "\r%s\n", estimateTimeToMatch(combined, rate))
+					fmt.Fprintf(os.Stderr, "\r\x1b[K%s\n", estimateTimeToMatch(combined, rate))
 					estimatePrinted = true
 				}
 			}
@@ -274,20 +274,21 @@ func reportProgress(ctx context.Context, attempts *uint64, feed *LiveFeed, combi
 			spin := spinnerFrames[frame%len(spinnerFrames)]
 			elapsed := now.Sub(start).Round(time.Second)
 
-			fmt.Fprintf(os.Stderr, "\r%c 0x%s   %s tried   %s/s   %s   ",
+			fmt.Fprintf(os.Stderr, "\r\x1b[K%c 0x%s   %s tried   %s/s   %s",
 				spin, addr, commify(total), commify(uint64(rate)), elapsed)
 		}
 	}
 }
 
-// estimateTimeToMatch computes a one-standard-deviation range for how long
-// finding a match should take, given the search space size (16^combined
-// candidates, each an independent 1-in-N chance) and the current hash
-// rate. Match count follows a geometric distribution, whose standard
-// deviation is very close to its own mean whenever the match probability
-// is small (as it always is here) -- so this range is naturally wide, and
-// its low end is naturally close to "could happen immediately". That's an
-// inherent property of these odds, not an approximation error.
+// estimateTimeToMatch computes the mean and a one-standard-deviation range
+// for how long finding a match should take, given the search space size
+// (16^combined candidates, each an independent 1-in-N chance) and the
+// current hash rate. Match count follows a geometric distribution, whose
+// standard deviation is very close to its own mean whenever the match
+// probability is small (as it always is here) -- so this range is
+// naturally wide, and its low end is naturally close to "could happen
+// immediately". That's an inherent property of these odds, not an
+// approximation error.
 func estimateTimeToMatch(combined int, rate float64) string {
 	p := 1 / math.Pow(16, float64(combined))
 	mean := 1 / p
@@ -299,12 +300,14 @@ func estimateTimeToMatch(combined int, rate float64) string {
 	}
 	highAttempts := mean + stddev
 
-	return fmt.Sprintf("Est. time to match (1σ range): %s", formatDurationRange(lowAttempts/rate, highAttempts/rate))
+	rangeStr, meanStr := formatDurationTriple(lowAttempts/rate, mean/rate, highAttempts/rate)
+	return fmt.Sprintf("Est. time to match (1σ range): %s (mean: %s)", rangeStr, meanStr)
 }
 
-// formatDurationRange formats two second counts as a range sharing a single
-// human-scaled unit chosen from the larger (high) value, e.g. "6.2-12.4h".
-func formatDurationRange(lowSeconds, highSeconds float64) string {
+// formatDurationTriple formats three second counts (a low/high range plus
+// the mean) sharing a single human-scaled unit chosen from the largest
+// (high) value, e.g. ("6.2-12.4h", "9.3h").
+func formatDurationTriple(lowSeconds, meanSeconds, highSeconds float64) (rangeStr, meanStr string) {
 	units := []struct {
 		secs  float64
 		label string
@@ -322,7 +325,9 @@ func formatDurationRange(lowSeconds, highSeconds float64) string {
 		}
 	}
 
-	return fmt.Sprintf("%s-%s%s", formatNum(lowSeconds/unit.secs), formatNum(highSeconds/unit.secs), unit.label)
+	rangeStr = fmt.Sprintf("%s-%s%s", formatNum(lowSeconds/unit.secs), formatNum(highSeconds/unit.secs), unit.label)
+	meanStr = fmt.Sprintf("%s%s", formatNum(meanSeconds/unit.secs), unit.label)
+	return rangeStr, meanStr
 }
 
 func formatNum(v float64) string {

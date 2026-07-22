@@ -1,6 +1,6 @@
 # eth-vanity
 
-A Rust CLI that generates an Ethereum keypair whose public address matches a "vanity" prefix and/or suffix, or (via the `create2` subcommand) mines a salt for a vanity CREATE2 contract address.
+A Rust CLI that generates an Ethereum key pair whose public address matches a "vanity" prefix and/or suffix, or (via the `create2` subcommand) mines a salt for a vanity CREATE2 contract address.
 
 ## Build
 

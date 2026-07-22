@@ -19,7 +19,12 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 Ethereum addresses are hex-encoded (`0-9`, `A-F`), matched case-insensitively — distinguishing `fedbad` from `fedBAD` via EIP-55 checksum casing would make a match astronomically rarer, so this tool doesn't do that.
 
 ```
-eth-vanity --prefix 0000 --suffix 666
+eth-vanity \
+  --prefix 0000 \       # (optional) the first two bytes of the address should be 00 00
+  --suffix 1111 \       # (optional) the last two bytes of the address should be 11 11
+  --extra-entropy       # (optional) mix in some randomness from random.org atmospheric noise
+  --threads 16 \        # (optional) run 16 parallel routines to search for a match
+  --output ./keystore   # (optional) save the ouput encrypted keystore file to ./keystore
 ```
 
 If neither `--prefix` nor `--suffix` is given, a random account is generated immediately. Once a match is found, you're prompted (with confirmation) for a passphrase to encrypt the resulting keystore — there's no flag for this, so it never ends up in shell history or process listings.
@@ -27,18 +32,21 @@ If neither `--prefix` nor `--suffix` is given, a random account is generated imm
 Short form:
 
 ```
-eth-vanity -p 1111 -s 1111 -o . -t 16
+eth-vanity -p 0000 -s 1111 -o ./keystore -t 16 -e
 ```
 
 Mine a CREATE2 vanity contract address instead of a wallet (pure hashing, no elliptic curve math — much faster than wallet search):
 
 ```
-eth-vanity create2 --deployer 0x... --init-code-hash 0x... --prefix 000000
+eth-vanity create2 \          # find salt for a vanity create2 contract address
+  --deployer 0x... \          # the address that will deploy the contract
+  --init-code-hash 0x... \    # hex-encoded hash of the init code for the deployment
+  --prefix 000000             # the prefix bytes of the desired vanity address
 ```
 
 Run `--help` / `create2 --help` for the full flag list, including `--extra-entropy` (optionally mix in randomness from random.org, on top of — never instead of — local OS randomness; see `src/entropy.rs`).
 
-## Example
+## Help
 ```
 eth-vanity --help
 ```

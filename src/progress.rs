@@ -70,7 +70,7 @@ pub fn report_progress(attempts: &AtomicU64, feed: &LiveFeed, running: &AtomicBo
             rate_window_start = now;
 
             if !estimate_printed && rate > 0.0 {
-                let _ = writeln!(stderr, "\r{}", estimate_time_to_match(combined, rate));
+                let _ = writeln!(stderr, "\r\x1b[K{}", estimate_time_to_match(combined, rate));
                 estimate_printed = true;
             }
         }
@@ -85,7 +85,7 @@ pub fn report_progress(attempts: &AtomicU64, feed: &LiveFeed, running: &AtomicBo
 
         let _ = write!(
             stderr,
-            "\r{spin} 0x{addr_str}   {} tried   {}/s   {elapsed}   ",
+            "\r\x1b[K{spin} 0x{addr_str}   {} tried   {}/s   {elapsed}",
             commify(total),
             commify(rate as u64),
         );
@@ -120,15 +120,14 @@ fn estimate_time_to_match(combined: usize, rate: f64) -> String {
     let low_attempts = (mean - stddev).max(0.0);
     let high_attempts = mean + stddev;
 
-    format!(
-        "Est. time to match (1\u{03c3} range): {}",
-        format_duration_range(low_attempts / rate, high_attempts / rate)
-    )
+    let (range_str, mean_str) = format_duration_triple(low_attempts / rate, mean / rate, high_attempts / rate);
+    format!("Est. time to match (1\u{03c3} range): {range_str} (mean: {mean_str})")
 }
 
-/// Formats two second counts as a range sharing a single human-scaled unit
-/// chosen from the larger (high) value, e.g. "6.2-12.4h".
-fn format_duration_range(low_seconds: f64, high_seconds: f64) -> String {
+/// Formats three second counts (a low/high range plus the mean) sharing a
+/// single human-scaled unit chosen from the largest (high) value, e.g.
+/// ("6.2-12.4h", "9.3h").
+fn format_duration_triple(low_seconds: f64, mean_seconds: f64, high_seconds: f64) -> (String, String) {
     const UNITS: [(f64, &str); 5] = [(1.0, "s"), (60.0, "m"), (3600.0, "h"), (86400.0, "d"), (86400.0 * 365.25, "y")];
 
     let mut unit = UNITS[0];
@@ -138,7 +137,9 @@ fn format_duration_range(low_seconds: f64, high_seconds: f64) -> String {
         }
     }
 
-    format!("{}-{}{}", format_num(low_seconds / unit.0), format_num(high_seconds / unit.0), unit.1)
+    let range_str = format!("{}-{}{}", format_num(low_seconds / unit.0), format_num(high_seconds / unit.0), unit.1);
+    let mean_str = format!("{}{}", format_num(mean_seconds / unit.0), unit.1);
+    (range_str, mean_str)
 }
 
 fn format_num(v: f64) -> String {

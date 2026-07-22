@@ -38,6 +38,43 @@ eth-vanity create2 --deployer 0x... --init-code-hash 0x... --prefix 000000
 
 Run `--help` / `create2 --help` for the full flag list, including `--extra-entropy` (optionally mix in randomness from random.org, on top of — never instead of — local OS randomness; see `src/entropy.rs`).
 
+## Example
+```
+eth-vanity --help
+```
+```
+Generates an Ethereum keypair whose public address matches a given prefix and/or suffix, then saves it as an encrypted keystore file.
+
+Usage: eth-vanity [OPTIONS] [COMMAND]
+
+Commands:
+  create2  Mine a salt so a CREATE2 deployment lands on a vanity contract address
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -p, --prefix <PREFIX>    Hex bytes required at the start of the address (no "0x" needed) [default: ""]
+  -s, --suffix <SUFFIX>    Hex bytes required at the end of the address [default: ""]
+  -o, --output <OUTPUT>    Directory to save the encrypted keystore file [default: .]
+  -t, --threads <THREADS>  Number of concurrent threads searching for a match (default: number of CPUs)
+  -e, --extra-entropy      Mix in additional randomness from random.org (supplements, never replaces, local OS randomness).
+                           Set RANDOM_ORG_API_KEY in the environment to use random.org's authenticated API.
+  -h, --help               Print help
+
+Notes:
+  - --prefix and --suffix accept only hex characters (0-9, a-f, A-F) and are matched
+    case-insensitively. Each extra hex character makes a match ~16x rarer, so long
+    values can take a long time to find.
+  - If neither --prefix nor --suffix is given, a random account is generated immediately.
+  - Once a matching address is found, you'll be prompted (with confirmation) for a
+    passphrase to encrypt the keystore -- there's no flag for this, so it never ends up
+    in shell history or process listings.
+  - This is CPU-bound work; going far past --threads = number of CPUs usually doesn't
+    help and can even slow things down.
+
+Subcommands:
+  create2   mine a salt for a vanity CREATE2 contract address instead of a wallet
+```
+
 ## Test
 
 ```

@@ -1,5 +1,5 @@
 [package]
-name = "eth-vanity-rs"
+name = "eth-vanity"
 version = "0.1.0"
 edition = "2024"
 

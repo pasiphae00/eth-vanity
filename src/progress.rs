@@ -49,7 +49,12 @@ const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 /// estimated-time-to-match range (not a countdown) derived from the search
 /// space size and that rate; `combined` is the total vanity byte length (0
 /// to skip the estimate, e.g. a random account with no prefix/suffix).
-pub fn report_progress(attempts: &AtomicU64, feed: &LiveFeed, running: &AtomicBool, combined: usize) {
+pub fn report_progress(
+    attempts: &AtomicU64,
+    feed: &LiveFeed,
+    running: &AtomicBool,
+    combined: usize,
+) {
     let start = Instant::now();
     let mut rate_window_start = start;
     let mut rate_window_attempts = 0u64;
@@ -120,15 +125,26 @@ fn estimate_time_to_match(combined: usize, rate: f64) -> String {
     let low_attempts = (mean - stddev).max(0.0);
     let high_attempts = mean + stddev;
 
-    let (range_str, mean_str) = format_duration_triple(low_attempts / rate, mean / rate, high_attempts / rate);
+    let (range_str, mean_str) =
+        format_duration_triple(low_attempts / rate, mean / rate, high_attempts / rate);
     format!("Est. time to match (1\u{03c3} range): {range_str} (mean: {mean_str})")
 }
 
 /// Formats three second counts (a low/high range plus the mean) sharing a
 /// single human-scaled unit chosen from the largest (high) value, e.g.
 /// ("6.2-12.4h", "9.3h").
-fn format_duration_triple(low_seconds: f64, mean_seconds: f64, high_seconds: f64) -> (String, String) {
-    const UNITS: [(f64, &str); 5] = [(1.0, "s"), (60.0, "m"), (3600.0, "h"), (86400.0, "d"), (86400.0 * 365.25, "y")];
+fn format_duration_triple(
+    low_seconds: f64,
+    mean_seconds: f64,
+    high_seconds: f64,
+) -> (String, String) {
+    const UNITS: [(f64, &str); 5] = [
+        (1.0, "s"),
+        (60.0, "m"),
+        (3600.0, "h"),
+        (86400.0, "d"),
+        (86400.0 * 365.25, "y"),
+    ];
 
     let mut unit = UNITS[0];
     for u in UNITS {
@@ -137,7 +153,12 @@ fn format_duration_triple(low_seconds: f64, mean_seconds: f64, high_seconds: f64
         }
     }
 
-    let range_str = format!("{}-{}{}", format_num(low_seconds / unit.0), format_num(high_seconds / unit.0), unit.1);
+    let range_str = format!(
+        "{}-{}{}",
+        format_num(low_seconds / unit.0),
+        format_num(high_seconds / unit.0),
+        unit.1
+    );
     let mean_str = format!("{}{}", format_num(mean_seconds / unit.0), unit.1);
     (range_str, mean_str)
 }

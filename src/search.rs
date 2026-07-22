@@ -17,12 +17,14 @@
 //! (e.g. profanity).
 
 use k256::elliptic_curve::point::AffineCoordinates;
-use k256::elliptic_curve::{BatchNormalize, Field};
+use k256::elliptic_curve::{BatchNormalize, Field, PrimeField};
 use k256::{ProjectivePoint, Scalar};
 use keccak_asm::{Digest, Keccak256};
+use rand::TryRng;
 use rand::rngs::SysRng;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::entropy::EXTERNAL_ENTROPY_BYTES;
 use crate::matching::MatchCriteria;
 use crate::progress::LiveFeed;
 
@@ -36,12 +38,54 @@ pub struct SearchResult {
     pub address: [u8; 20],
 }
 
-fn random_scalar() -> Scalar {
-    // ff::Field::try_random performs rejection sampling internally, matching
-    // the rigor of standard ECDSA key generation. SysRng is fallible (it's
-    // backed by the OS entropy source), which failing is astronomically
-    // unlikely and not meaningfully recoverable, hence the expect.
-    Scalar::try_random(&mut SysRng).expect("OS RNG failed")
+/// Draws a uniformly random, non-zero scalar in [1, N-1] using rejection
+/// sampling, matching the rigor of standard ECDSA key generation.
+///
+/// If external_entropy is Some (an --extra-entropy fetch succeeded), each
+/// draw is additionally mixed with it via mix_entropy before being
+/// interpreted as a scalar. Local OS randomness is always drawn fresh on
+/// every attempt regardless; external_entropy only ever supplements it, so
+/// a doctored or absent external source can never make this weaker than
+/// local randomness alone -- only fail to add anything.
+fn random_scalar(external_entropy: Option<&[u8; EXTERNAL_ENTROPY_BYTES]>, worker: usize) -> Scalar {
+    loop {
+        let mut local = [0u8; 32];
+        SysRng.try_fill_bytes(&mut local).expect("OS RNG failed");
+
+        let seed = match external_entropy {
+            Some(ext) => mix_entropy(&local, ext, worker),
+            None => local,
+        };
+
+        if let Some(scalar) = Option::from(Scalar::from_repr(seed.into())) {
+            let scalar: Scalar = scalar;
+            if !bool::from(Field::is_zero(&scalar)) {
+                return scalar;
+            }
+        }
+    }
+}
+
+/// Combines fresh local randomness with a shared external randomness
+/// source into a single 32-byte seed via Keccak256. Hashing preserves the
+/// local input's full entropy regardless of the quality of external
+/// (even all-zero or attacker-chosen bytes), so this can only add
+/// security, never remove it. worker differentiates otherwise identical
+/// external entropy across concurrent workers, though each worker's fresh
+/// local component already ensures independence on its own.
+fn mix_entropy(
+    local: &[u8; 32],
+    external: &[u8; EXTERNAL_ENTROPY_BYTES],
+    worker: usize,
+) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(local);
+    hasher.update(external);
+    hasher.update((worker as u64).to_be_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 /// Computes the address for an affine point: keccak256(X || Y)[12..].
@@ -61,8 +105,9 @@ pub fn search_worker(
     running: &AtomicBool,
     feed: Option<&LiveFeed>,
     worker: usize,
+    external_entropy: Option<&[u8; EXTERNAL_ENTROPY_BYTES]>,
 ) -> Option<SearchResult> {
-    let k0 = random_scalar();
+    let k0 = random_scalar(external_entropy, worker);
     let mut cur = ProjectivePoint::mul_by_generator_vartime(&k0);
 
     let mut batch = vec![ProjectivePoint::IDENTITY; BATCH_SIZE];
@@ -131,6 +176,7 @@ pub fn search(
     attempts: &AtomicU64,
     feed: Option<&LiveFeed>,
     running: &AtomicBool,
+    external_entropy: Option<&[u8; EXTERNAL_ENTROPY_BYTES]>,
 ) -> Option<SearchResult> {
     std::thread::scope(|scope| {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -138,7 +184,9 @@ pub fn search(
         for worker in 0..threads {
             let tx = tx.clone();
             scope.spawn(move || {
-                if let Some(result) = search_worker(criteria, attempts, running, feed, worker) {
+                if let Some(result) =
+                    search_worker(criteria, attempts, running, feed, worker, external_entropy)
+                {
                     running.store(false, Ordering::Relaxed);
                     let _ = tx.send(result);
                 }
@@ -180,7 +228,7 @@ mod tests {
         const TEST_BATCH: usize = 8;
         const NUM_BATCHES: usize = 5;
 
-        let k0 = random_scalar();
+        let k0 = random_scalar(None, 0);
         let mut cur = ProjectivePoint::mul_by_generator_vartime(&k0);
         let mut hasher = Keccak256::new();
         let mut total_offset: u64 = 0;
@@ -217,7 +265,7 @@ mod tests {
             let attempts = AtomicU64::new(0);
             let running = AtomicBool::new(true);
 
-            let result = search(&criteria, 4, &attempts, None, &running)
+            let result = search(&criteria, 4, &attempts, None, &running, None)
                 .expect("search should find a match");
 
             let mut addr_hex = [0u8; 40];
@@ -240,7 +288,7 @@ mod tests {
     #[test]
     fn point_addition_matches_reference_for_small_offsets() {
         for offset in 0u64..20 {
-            let k0 = random_scalar();
+            let k0 = random_scalar(None, 0);
             let mut cur = ProjectivePoint::mul_by_generator_vartime(&k0);
             for _ in 0..offset {
                 cur += ProjectivePoint::GENERATOR;
@@ -250,5 +298,78 @@ mod tests {
             let want = reference_address(k0 + Scalar::from(offset));
             assert_eq!(got, want, "offset={offset}");
         }
+    }
+
+    #[test]
+    fn mix_entropy_is_deterministic_and_sensitive_to_each_input() {
+        let local = [
+            1u8, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        let external = [0xABu8; EXTERNAL_ENTROPY_BYTES];
+
+        let got = mix_entropy(&local, &external, 0);
+
+        // Cross-checked independently: Keccak256(local || external || worker_be_u64).
+        let mut hasher = Keccak256::new();
+        hasher.update(local);
+        hasher.update(external);
+        hasher.update(0u64.to_be_bytes());
+        let want: [u8; 32] = hasher.finalize().into();
+        assert_eq!(
+            got, want,
+            "mix_entropy doesn't match an independently computed Keccak256"
+        );
+
+        // Changing any single input should change the output.
+        let other_local = [9u8; 32];
+        assert_ne!(
+            mix_entropy(&other_local, &external, 0),
+            got,
+            "changing local entropy did not change the mixed seed"
+        );
+        let other_external = [0xCDu8; EXTERNAL_ENTROPY_BYTES];
+        assert_ne!(
+            mix_entropy(&local, &other_external, 0),
+            got,
+            "changing external entropy did not change the mixed seed"
+        );
+        assert_ne!(
+            mix_entropy(&local, &external, 1),
+            got,
+            "changing worker index did not change the mixed seed"
+        );
+    }
+
+    #[test]
+    fn random_scalar_with_external_entropy_is_valid() {
+        let external = [0x11u8; EXTERNAL_ENTROPY_BYTES];
+        let scalar = random_scalar(Some(&external), 0);
+        assert!(!bool::from(Field::is_zero(&scalar)));
+    }
+
+    /// Re-runs the private-key-reproduces-address invariant with a (fake,
+    /// fixed) external entropy source mixed in, to make sure that code path
+    /// is exercised and still produces a correct, usable key.
+    #[test]
+    fn search_end_to_end_with_external_entropy() {
+        let criteria = MatchCriteria {
+            prefix: b"a".to_vec(),
+            suffix: vec![],
+        };
+        let attempts = AtomicU64::new(0);
+        let running = AtomicBool::new(true);
+        let external = [0x99u8; EXTERNAL_ENTROPY_BYTES];
+
+        let result = search(&criteria, 4, &attempts, None, &running, Some(&external))
+            .expect("search should find a match");
+
+        let scalar_bytes: [u8; 32] = result.private_key;
+        let scalar = Scalar::from_repr(scalar_bytes.into()).expect("valid scalar");
+        let derived = reference_address(scalar);
+        assert_eq!(
+            derived, result.address,
+            "private key does not reproduce the found address"
+        );
     }
 }

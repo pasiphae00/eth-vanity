@@ -4,6 +4,7 @@
 //! subcommand) mining a CREATE2 salt for a vanity contract address.
 
 mod create2;
+mod entropy;
 mod keystore;
 mod matching;
 mod progress;
@@ -41,6 +42,12 @@ struct Cli {
     /// Number of concurrent threads searching for a match (default: number of CPUs)
     #[arg(short = 't', long)]
     threads: Option<usize>,
+
+    /// Mix in additional randomness from random.org (supplements, never replaces,
+    /// local OS randomness). Set RANDOM_ORG_API_KEY in the environment to use
+    /// random.org's authenticated API instead of the free legacy endpoint.
+    #[arg(short = 'e', long)]
+    extra_entropy: bool,
 }
 
 #[derive(Subcommand)]
@@ -98,7 +105,13 @@ fn main() -> anyhow::Result<()> {
             threads,
             output,
         ),
-        None => run_wallet(cli.prefix, cli.suffix, cli.output, cli.threads),
+        None => run_wallet(
+            cli.prefix,
+            cli.suffix,
+            cli.output,
+            cli.threads,
+            cli.extra_entropy,
+        ),
     }
 }
 
@@ -122,6 +135,7 @@ fn run_wallet(
     suffix: String,
     output: String,
     threads: Option<usize>,
+    extra_entropy: bool,
 ) -> anyhow::Result<()> {
     let (prefix, suffix) = validate_vanity_bytes(&prefix, &suffix)?;
     let threads = default_threads(threads);
@@ -132,6 +146,29 @@ fn run_wallet(
     if output_path.exists() && !output_path.is_dir() {
         anyhow::bail!("--output {output:?} exists and is not a directory");
     }
+
+    let external_entropy = if extra_entropy {
+        let source = if entropy::using_authenticated_api() {
+            "authenticated API"
+        } else {
+            "free legacy endpoint"
+        };
+        eprintln!("Fetching additional entropy from random.org ({source})...");
+        match entropy::fetch_external_entropy() {
+            Ok(e) => {
+                eprintln!("Mixing in additional entropy from random.org.");
+                Some(e)
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not fetch additional entropy ({e}); continuing with OS randomness only."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let criteria = MatchCriteria {
         prefix: prefix.into_bytes(),
@@ -153,7 +190,14 @@ fn run_wallet(
         let pr = progress_running.clone();
         scope.spawn(move || progress::report_progress(attempts_ref, feed_ref, &pr, combined));
 
-        let result = search::search(&criteria, threads, attempts_ref, Some(feed_ref), &running);
+        let result = search::search(
+            &criteria,
+            threads,
+            attempts_ref,
+            Some(feed_ref),
+            &running,
+            external_entropy.as_ref(),
+        );
         progress_running.store(false, Ordering::Relaxed);
         result
     });

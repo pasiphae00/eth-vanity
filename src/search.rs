@@ -175,6 +175,24 @@ pub fn search_worker(
     }
 }
 
+/// Recomputes the address for a found key by a plain scalar multiplication,
+/// a separate route from the batched point walk that found it. A disagreement
+/// is a bug in the search: the key would not control the address it was
+/// reported under, so nothing must be saved or printed as a success.
+pub fn verify(result: &SearchResult) -> anyhow::Result<()> {
+    let scalar = Option::<Scalar>::from(Scalar::from_repr((**result.private_key).into()))
+        .ok_or_else(|| anyhow::anyhow!("internal error: found key is not a valid scalar"))?;
+    let point = ProjectivePoint::GENERATOR * *Zeroizing::new(scalar);
+    let derived = address_from_affine(&mut Keccak256::new(), &point.to_affine());
+    anyhow::ensure!(
+        derived == result.address,
+        "internal error: found key derives 0x{}, not the reported 0x{}",
+        hex::encode(derived),
+        hex::encode(result.address)
+    );
+    Ok(())
+}
+
 /// Spawns `threads` OS threads that each walk an independent chain of
 /// candidate keys (see `search_worker`) until one matches criteria or
 /// `running` is cleared (e.g. by a Ctrl+C handler). Returns None if the
@@ -292,6 +310,24 @@ mod tests {
                 "private key does not reproduce the found address"
             );
         }
+    }
+
+    #[test]
+    fn verify_accepts_a_real_result_and_rejects_a_mismatch() {
+        let scalar = random_scalar(None, 0);
+        let result = SearchResult {
+            private_key: Box::new(Zeroizing::new(scalar.to_bytes().into())),
+            address: reference_address(scalar),
+        };
+        verify(&result).expect("a genuine key/address pair should verify");
+
+        let mut wrong_address = result.address;
+        wrong_address[0] ^= 1;
+        let tampered = SearchResult {
+            address: wrong_address,
+            ..result
+        };
+        assert!(verify(&tampered).is_err());
     }
 
     #[test]

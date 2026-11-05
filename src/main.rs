@@ -208,6 +208,7 @@ fn run_wallet(
         eprintln!("Interrupted: search cancelled");
         std::process::exit(1);
     };
+    search::verify(&result)?;
 
     println!(
         "Wallet found! Address: 0x{} ({} attempts)",

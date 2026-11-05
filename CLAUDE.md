@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`eth-vanity` is a Rust CLI that generates an Ethereum keypair whose public address matches a vanity prefix/suffix (saved as a geth-compatible encrypted keystore), or, via the `create2` subcommand, mines a salt for a vanity CREATE2 contract address.
+`eth-vanity` is a Rust CLI that generates an Ethereum keypair whose public address matches a vanity prefix/suffix (saved as a geth-compatible encrypted keystore), or, via the `create2` subcommand, mines a salt for a vanity CREATE2 contract address. The `seed`/`offset`/`combine` subcommands do the wallet search from a public key alone, so it can run on an untrusted machine.
 
 This project started as a Go CLI, then was rewritten from scratch in Rust to benchmark against it (~2-3x faster on both modes with the same algorithms). The Rust version won and replaced the Go one outright; this repo's git history contains both projects' commits merged together, so `git log` before the merge point will show Go commits.
 
@@ -20,7 +20,7 @@ cargo fmt
 
 ## Architecture
 
-- `src/main.rs` — clap CLI (wallet mode is the default subcommand-less invocation; `create2` is the other). Orchestrates: validate flags → search → print result → (wallet only) prompt passphrase and save keystore, or (create2) optionally save JSON.
+- `src/main.rs` — clap CLI (wallet mode is the default subcommand-less invocation; `create2` and the split-key `seed`/`offset`/`combine` are the others). Orchestrates: validate flags → search → print result → (wallet only) prompt passphrase and save keystore, or (create2) optionally save JSON.
 - `src/matching.rs` — `MatchCriteria` (prefix/suffix matching) and shared hex validation/parsing helpers used by both modes.
 - `src/search.rs` — wallet-mode key search. The performance-critical core: each thread walks a chain of consecutive private keys from a random starting scalar (`k0*G`, `(k0+1)*G`, ...) via cheap point addition rather than a full scalar multiplication per candidate, batching points and converting to affine coordinates together via one batched modular inversion (`k256`'s built-in `batch_normalize_vartime`) to amortize that cost. Don't reintroduce a full scalar-mult-per-candidate loop without benchmarking first — it was tried and measured meaningfully slower.
 - `src/create2.rs` — CREATE2 salt mining per EIP-1014. Pure Keccak256 hashing, no elliptic-curve math, so no batching trick needed — this is close to hash-function-speed-limited already.
@@ -30,6 +30,7 @@ cargo fmt
 
 ### Key invariants to preserve
 
-- **The private key returned by `search()` must always reproduce the address returned alongside it.** This is checked by dedicated end-to-end tests; if you touch the point-increment/batch-inversion math in `search.rs`, run those tests and ideally add a cross-check against an independently computed reference (see existing tests for the pattern) before trusting any change.
+- **The private key returned by `search()` must always reproduce the address returned alongside it.** This is checked by dedicated end-to-end tests and again at runtime by `search::verify` before anything is reported; if you touch the point-increment/batch-inversion math in `search.rs`, run those tests and ideally add a cross-check against an independently computed reference (see existing tests for the pattern) before trusting any change.
+- **`offset` must never touch a private key.** It takes a public key and reports a scalar to add to the seed; a private-key input there would defeat the point of the flow. `combine` is the only place the two come together, and it must check the result against the expected address before saving.
 - **External entropy only ever supplements local OS randomness, never replaces it.** Local randomness is drawn fresh on every scalar-generation attempt regardless of whether `--extra-entropy` is set.
 - Buffers passed into `hasher.Write`/`.update()`-style interface calls must be hoisted out of hot loops (declared once, reused), not declared fresh per iteration — passing a stack slice into an interface/trait method defeats escape analysis in Go and can similarly force unwanted allocation patterns in Rust; this was a real, measured perf bug worth not reintroducing.

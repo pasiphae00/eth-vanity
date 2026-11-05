@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::entropy::EXTERNAL_ENTROPY_BYTES;
-use crate::matching::MatchCriteria;
+use crate::matching::{MatchCriteria, normalize_hex};
 use crate::progress::LiveFeed;
 
 /// How many consecutive candidate points get accumulated before paying for
@@ -34,11 +34,15 @@ use crate::progress::LiveFeed;
 /// coordinates at once.
 const BATCH_SIZE: usize = 1024;
 
+/// Boxed so a key stays at one heap address, wiped on drop. Moving an inline
+/// array through the result channel would leave copies behind that Zeroizing
+/// can't reach.
+pub type KeyBytes = Box<Zeroizing<[u8; 32]>>;
+
 pub struct SearchResult {
-    /// Boxed so the key stays at one heap address, wiped on drop. Moving an
-    /// inline array through the result channel would leave copies behind
-    /// that Zeroizing can't reach.
-    pub private_key: Box<Zeroizing<[u8; 32]>>,
+    /// The private key for `address`, or with a base point, the offset to
+    /// add to the base's private key to get it.
+    pub scalar: KeyBytes,
     pub address: [u8; 20],
 }
 
@@ -113,9 +117,13 @@ pub fn search_worker(
     feed: Option<&LiveFeed>,
     worker: usize,
     external_entropy: Option<&[u8; EXTERNAL_ENTROPY_BYTES]>,
+    base: Option<&ProjectivePoint>,
 ) -> Option<SearchResult> {
     let k0 = Zeroizing::new(random_scalar(external_entropy, worker));
     let mut cur = ProjectivePoint::mul_by_generator_vartime(&k0);
+    if let Some(base) = base {
+        cur += base;
+    }
 
     let mut batch = vec![ProjectivePoint::IDENTITY; BATCH_SIZE];
     let mut hasher = Keccak256::new();
@@ -160,13 +168,8 @@ pub fn search_worker(
             let offset = Scalar::from(total_offset);
             let match_scalar = Zeroizing::new(*k0 + offset);
 
-            let mut key_bytes = match_scalar.to_bytes();
-            let mut private_key = Box::new(Zeroizing::new([0u8; 32]));
-            private_key.copy_from_slice(&key_bytes);
-            key_bytes.as_mut_slice().zeroize();
-
             return Some(SearchResult {
-                private_key,
+                scalar: key_bytes(&match_scalar),
                 address: addr,
             });
         }
@@ -175,28 +178,105 @@ pub fn search_worker(
     }
 }
 
-/// Recomputes the address for a found key by a plain scalar multiplication,
-/// a separate route from the batched point walk that found it. A disagreement
-/// is a bug in the search: the key would not control the address it was
-/// reported under, so nothing must be saved or printed as a success.
-pub fn verify(result: &SearchResult) -> anyhow::Result<()> {
-    let scalar = Option::<Scalar>::from(Scalar::from_repr((**result.private_key).into()))
-        .ok_or_else(|| anyhow::anyhow!("internal error: found key is not a valid scalar"))?;
-    let point = ProjectivePoint::GENERATOR * *Zeroizing::new(scalar);
-    let derived = address_from_affine(&mut Keccak256::new(), &point.to_affine());
+fn scalar_from_bytes(bytes: &[u8; 32]) -> anyhow::Result<Zeroizing<Scalar>> {
+    Option::<Scalar>::from(Scalar::from_repr((*bytes).into()))
+        .map(Zeroizing::new)
+        .ok_or_else(|| anyhow::anyhow!("value is not a valid secp256k1 scalar"))
+}
+
+fn key_bytes(scalar: &Scalar) -> KeyBytes {
+    let mut bytes = scalar.to_bytes();
+    let mut key = Box::new(Zeroizing::new([0u8; 32]));
+    key.copy_from_slice(&bytes);
+    bytes.as_mut_slice().zeroize();
+    key
+}
+
+/// Address of scalar*G + base, by a plain scalar multiplication: a separate
+/// route from the batched point walk in `search_worker`.
+fn address_of(scalar: &Scalar, base: Option<&ProjectivePoint>) -> [u8; 20] {
+    let mut point = ProjectivePoint::GENERATOR * *scalar;
+    if let Some(base) = base {
+        point += base;
+    }
+    address_from_affine(&mut Keccak256::new(), &point.to_affine())
+}
+
+/// Recomputes the address for a search result, using the same `base` the
+/// search ran with. A disagreement is a bug in the search: the scalar would
+/// not lead to the address it was reported under, so nothing must be saved
+/// or printed as a success.
+pub fn verify(result: &SearchResult, base: Option<&ProjectivePoint>) -> anyhow::Result<()> {
+    let scalar = scalar_from_bytes(&result.scalar)?;
+    let derived = address_of(&scalar, base);
     anyhow::ensure!(
         derived == result.address,
-        "internal error: found key derives 0x{}, not the reported 0x{}",
+        "internal error: search result derives 0x{}, not the reported 0x{}",
         hex::encode(derived),
         hex::encode(result.address)
     );
     Ok(())
 }
 
+/// The address controlled by a private key.
+pub fn address_of_key(private_key: &[u8; 32]) -> anyhow::Result<[u8; 20]> {
+    Ok(address_of(&*scalar_from_bytes(private_key)?, None))
+}
+
+/// Draws a fresh private key from OS randomness, for use as a seed key.
+pub fn generate_key() -> KeyBytes {
+    key_bytes(&Zeroizing::new(random_scalar(None, 0)))
+}
+
+/// X||Y of a private key's public key, as 128 hex characters: the form
+/// `parse_public_key` takes.
+pub fn public_key_hex(private_key: &[u8; 32]) -> anyhow::Result<String> {
+    let scalar = scalar_from_bytes(private_key)?;
+    let point = (ProjectivePoint::GENERATOR * *scalar).to_affine();
+    Ok(format!(
+        "{}{}",
+        hex::encode(point.x()),
+        hex::encode(point.y())
+    ))
+}
+
+/// Parses an uncompressed public key: 128 hex characters of X||Y, optionally
+/// with the leading 04 byte. Rejects anything not on the curve. The input is
+/// never echoed in errors, in case someone pasted the wrong key.
+pub fn parse_public_key(s: &str) -> anyhow::Result<ProjectivePoint> {
+    let hex = normalize_hex(s);
+    let sec1 = match hex.len() {
+        128 => format!("04{hex}"),
+        130 => hex,
+        64 => anyhow::bail!(
+            "got 64 hex characters, the length of a private key; pass the public key from `eth-vanity seed` instead"
+        ),
+        n => anyhow::bail!("expected a 128-character public key, got {n} characters"),
+    };
+    let bytes = hex::decode(&sec1).map_err(|_| anyhow::anyhow!("public key is not valid hex"))?;
+    let key = k256::PublicKey::from_sec1_bytes(&bytes)
+        .map_err(|_| anyhow::anyhow!("public key is not a point on secp256k1"))?;
+    Ok(key.to_projective())
+}
+
+/// Computes seed + offset mod N, the private key for an address found by an
+/// offset search.
+pub fn combine(seed: &[u8; 32], offset: &[u8; 32]) -> anyhow::Result<KeyBytes> {
+    let sum = Zeroizing::new(*scalar_from_bytes(seed)? + *scalar_from_bytes(offset)?);
+    anyhow::ensure!(
+        !bool::from(Field::is_zero(&*sum)),
+        "seed and offset sum to zero, which is not a valid private key"
+    );
+    Ok(key_bytes(&sum))
+}
+
 /// Spawns `threads` OS threads that each walk an independent chain of
 /// candidate keys (see `search_worker`) until one matches criteria or
 /// `running` is cleared (e.g. by a Ctrl+C handler). Returns None if the
 /// search was interrupted before any match was found.
+///
+/// With `base` set, chains start at base + k0*G instead of k0*G, so the search
+/// needs only a public key and yields an offset rather than a private key.
 pub fn search(
     criteria: &MatchCriteria,
     threads: usize,
@@ -204,6 +284,7 @@ pub fn search(
     feed: Option<&LiveFeed>,
     running: &AtomicBool,
     external_entropy: Option<&[u8; EXTERNAL_ENTROPY_BYTES]>,
+    base: Option<&ProjectivePoint>,
 ) -> Option<SearchResult> {
     std::thread::scope(|scope| {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -211,9 +292,15 @@ pub fn search(
         for worker in 0..threads {
             let tx = tx.clone();
             scope.spawn(move || {
-                if let Some(result) =
-                    search_worker(criteria, attempts, running, feed, worker, external_entropy)
-                {
+                if let Some(result) = search_worker(
+                    criteria,
+                    attempts,
+                    running,
+                    feed,
+                    worker,
+                    external_entropy,
+                    base,
+                ) {
                     running.store(false, Ordering::Relaxed);
                     let _ = tx.send(result);
                 }
@@ -292,7 +379,7 @@ mod tests {
             let attempts = AtomicU64::new(0);
             let running = AtomicBool::new(true);
 
-            let result = search(&criteria, 4, &attempts, None, &running, None)
+            let result = search(&criteria, 4, &attempts, None, &running, None, None)
                 .expect("search should find a match");
 
             let mut addr_hex = [0u8; 40];
@@ -302,7 +389,7 @@ mod tests {
                 "address {addr_hex:?} doesn't satisfy criteria"
             );
 
-            let scalar_bytes: [u8; 32] = **result.private_key;
+            let scalar_bytes: [u8; 32] = **result.scalar;
             let scalar = Scalar::from_repr(scalar_bytes.into()).expect("valid scalar");
             let derived = reference_address(scalar);
             assert_eq!(
@@ -316,10 +403,10 @@ mod tests {
     fn verify_accepts_a_real_result_and_rejects_a_mismatch() {
         let scalar = random_scalar(None, 0);
         let result = SearchResult {
-            private_key: Box::new(Zeroizing::new(scalar.to_bytes().into())),
+            scalar: key_bytes(&scalar),
             address: reference_address(scalar),
         };
-        verify(&result).expect("a genuine key/address pair should verify");
+        verify(&result, None).expect("a genuine key/address pair should verify");
 
         let mut wrong_address = result.address;
         wrong_address[0] ^= 1;
@@ -327,7 +414,93 @@ mod tests {
             address: wrong_address,
             ..result
         };
-        assert!(verify(&tampered).is_err());
+        assert!(verify(&tampered, None).is_err());
+    }
+
+    /// The whole offset flow against an independently computed reference:
+    /// the search sees only the public key, and seed + offset must control
+    /// the address it reported.
+    #[test]
+    fn offset_search_end_to_end_recovers_key_for_address() {
+        let seed = generate_key();
+        let base = parse_public_key(&public_key_hex(&seed).unwrap()).unwrap();
+
+        for _ in 0..10 {
+            let criteria = MatchCriteria {
+                prefix: b"a".to_vec(),
+                suffix: vec![],
+            };
+            let attempts = AtomicU64::new(0);
+            let running = AtomicBool::new(true);
+
+            let result = search(&criteria, 4, &attempts, None, &running, None, Some(&base))
+                .expect("search should find a match");
+            verify(&result, Some(&base)).expect("offset should verify against the base");
+
+            let key = combine(&seed, &result.scalar).expect("combine");
+            let scalar = Scalar::from_repr((**key).into()).expect("valid scalar");
+            assert_eq!(reference_address(scalar), result.address);
+            assert_ne!(
+                address_of_key(&result.scalar).unwrap(),
+                result.address,
+                "the offset alone must not control the address"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_rejects_the_wrong_base() {
+        let base = parse_public_key(&public_key_hex(&generate_key()).unwrap()).unwrap();
+        let other = parse_public_key(&public_key_hex(&generate_key()).unwrap()).unwrap();
+        let scalar = random_scalar(None, 0);
+        let result = SearchResult {
+            scalar: key_bytes(&scalar),
+            address: address_of(&scalar, Some(&base)),
+        };
+
+        assert!(verify(&result, Some(&base)).is_ok());
+        assert!(verify(&result, Some(&other)).is_err());
+    }
+
+    #[test]
+    fn address_of_key_matches_known_vector() {
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        assert_eq!(
+            hex::encode(address_of_key(&one).unwrap()),
+            "7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+        );
+    }
+
+    #[test]
+    fn parse_public_key_accepts_valid_forms_and_rejects_bad_input() {
+        let key = generate_key();
+        let hex = public_key_hex(&key).unwrap();
+        let want = ProjectivePoint::GENERATOR * *scalar_from_bytes(&key).unwrap();
+
+        assert_eq!(parse_public_key(&hex).unwrap(), want);
+        assert_eq!(parse_public_key(&format!("04{hex}")).unwrap(), want);
+        assert_eq!(parse_public_key(&format!("0x04{hex}")).unwrap(), want);
+
+        let off_curve = format!("{}{}", "11".repeat(32), "22".repeat(32));
+        for bad in ["", "abcd", &hex[..127], &"zz".repeat(64), &off_curve] {
+            assert!(parse_public_key(bad).is_err(), "accepted {bad:?}");
+        }
+
+        let private = hex::encode(**key);
+        let err = parse_public_key(&private).err().unwrap().to_string();
+        assert!(err.contains("private key"), "unhelpful error: {err}");
+        assert!(!err.contains(&private), "error echoed the key");
+    }
+
+    #[test]
+    fn combine_rejects_a_zero_sum_and_out_of_range_input() {
+        let seed = random_scalar(None, 0);
+        let negated: [u8; 32] = (-seed).to_bytes().into();
+        let seed: [u8; 32] = seed.to_bytes().into();
+
+        assert!(combine(&seed, &negated).is_err());
+        assert!(combine(&seed, &[0xff; 32]).is_err());
     }
 
     #[test]
@@ -406,10 +579,18 @@ mod tests {
         let running = AtomicBool::new(true);
         let external = [0x99u8; EXTERNAL_ENTROPY_BYTES];
 
-        let result = search(&criteria, 4, &attempts, None, &running, Some(&external))
-            .expect("search should find a match");
+        let result = search(
+            &criteria,
+            4,
+            &attempts,
+            None,
+            &running,
+            Some(&external),
+            None,
+        )
+        .expect("search should find a match");
 
-        let scalar_bytes: [u8; 32] = **result.private_key;
+        let scalar_bytes: [u8; 32] = **result.scalar;
         let scalar = Scalar::from_repr(scalar_bytes.into()).expect("valid scalar");
         let derived = reference_address(scalar);
         assert_eq!(

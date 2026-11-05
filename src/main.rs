@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[command(
     name = "eth-vanity-rs",
     about = "Generates an Ethereum keypair whose public address matches a given prefix and/or suffix, then saves it as an encrypted keystore file.",
-    after_help = "Notes:\n  - --prefix and --suffix accept only hex characters (0-9, a-f, A-F) and are matched\n    case-insensitively. Each extra hex character makes a match ~16x rarer, so long\n    values can take a long time to find.\n  - If neither --prefix nor --suffix is given, a random account is generated immediately.\n  - Once a matching address is found, you'll be prompted (with confirmation) for a\n    passphrase (at least 12 characters) to encrypt the keystore -- there's no flag for this, so it never ends up\n    in shell history or process listings.\n  - This is CPU-bound work; going far past --threads = number of CPUs usually doesn't\n    help and can even slow things down.\n\nSubcommands:\n  create2   mine a salt for a vanity CREATE2 contract address instead of a wallet"
+    after_help = "Notes:\n  - --prefix and --suffix accept only hex characters (0-9, a-f, A-F) and are matched\n    case-insensitively. Each extra hex character makes a match ~16x rarer, so long\n    values can take a long time to find.\n  - If neither --prefix nor --suffix is given, a random account is generated immediately.\n  - Once a matching address is found, you'll be prompted (with confirmation) for a\n    passphrase (at least 12 characters) to encrypt the keystore -- there's no flag for this, so it never ends up\n    in shell history or process listings.\n  - This is CPU-bound work; going far past --threads = number of CPUs usually doesn't\n    help and can even slow things down.\n\nSubcommands:\n  create2   mine a salt for a vanity CREATE2 contract address instead of a wallet\n  seed, offset, combine\n            search without the private key on the searching machine (split-key flow)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -82,6 +82,51 @@ enum Commands {
         #[arg(short = 'o', long)]
         output: Option<String>,
     },
+
+    /// Split-key step 1, on a trusted machine: make a seed keypair to search from
+    Seed {
+        /// Directory to save the encrypted seed keystore file
+        #[arg(short = 'o', long, default_value = ".")]
+        output: String,
+    },
+
+    /// Split-key step 2, on any machine: search for an offset using only a public key
+    Offset {
+        /// The seed's public key, as printed by `seed`
+        #[arg(short = 'k', long = "public-key")]
+        public_key: String,
+
+        /// Hex bytes required at the start of the address
+        #[arg(short = 'p', long, default_value = "")]
+        prefix: String,
+
+        /// Hex bytes required at the end of the address
+        #[arg(short = 's', long, default_value = "")]
+        suffix: String,
+
+        /// Number of concurrent threads searching for a match (default: number of CPUs)
+        #[arg(short = 't', long)]
+        threads: Option<usize>,
+    },
+
+    /// Split-key step 3, on the trusted machine: add the offset to the seed and save the key
+    Combine {
+        /// Path to the seed keystore file made by `seed`
+        #[arg(long = "seed-keystore")]
+        seed_keystore: String,
+
+        /// The offset reported by `offset`
+        #[arg(long)]
+        offset: String,
+
+        /// The address reported by `offset`; the result is checked against it
+        #[arg(long)]
+        address: String,
+
+        /// Directory to save the final encrypted keystore file
+        #[arg(short = 'o', long, default_value = ".")]
+        output: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -105,6 +150,19 @@ fn main() -> anyhow::Result<()> {
             threads,
             output,
         ),
+        Some(Commands::Seed { output }) => run_seed(output),
+        Some(Commands::Offset {
+            public_key,
+            prefix,
+            suffix,
+            threads,
+        }) => run_offset(public_key, prefix, suffix, threads),
+        Some(Commands::Combine {
+            seed_keystore,
+            offset,
+            address,
+            output,
+        }) => run_combine(seed_keystore, offset, address, output),
         None => run_wallet(
             cli.prefix,
             cli.suffix,
@@ -142,11 +200,7 @@ fn run_wallet(
     if threads < 1 {
         anyhow::bail!("--threads must be at least 1");
     }
-    let output_path = PathBuf::from(&output);
-    if output_path.exists() && !output_path.is_dir() {
-        anyhow::bail!("--output {output:?} exists and is not a directory");
-    }
-    keystore::check_output_dir(&output_path)?;
+    let output_path = output_dir(&output)?;
 
     let external_entropy = if extra_entropy {
         let source = if entropy::using_authenticated_api() {
@@ -175,7 +229,34 @@ fn run_wallet(
         prefix: prefix.into_bytes(),
         suffix: suffix.into_bytes(),
     };
-    print_search_info(&criteria, threads);
+    let (result, attempts) = run_search(&criteria, threads, external_entropy.as_ref(), None);
+    search::verify(&result, None)?;
+
+    println!(
+        "Wallet found! Address: 0x{} ({attempts} attempts)",
+        hex::encode(result.address),
+    );
+
+    let passphrase = keystore::read_passphrase()?;
+    let path = keystore::save(
+        &output_path,
+        &result.address,
+        &result.scalar,
+        passphrase.as_bytes(),
+    )?;
+    println!("Keystore saved to: {}", path.display());
+    Ok(())
+}
+
+/// Runs a wallet-style search with the live progress display, exiting the
+/// process if it's interrupted. Returns the result and the attempt count.
+fn run_search(
+    criteria: &MatchCriteria,
+    threads: usize,
+    external_entropy: Option<&[u8; entropy::EXTERNAL_ENTROPY_BYTES]>,
+    base: Option<&k256::ProjectivePoint>,
+) -> (search::SearchResult, u64) {
+    print_search_info(criteria, threads);
 
     let running = Arc::new(AtomicBool::new(true));
     install_ctrlc_handler(&running);
@@ -192,12 +273,13 @@ fn run_wallet(
         scope.spawn(move || progress::report_progress(attempts_ref, feed_ref, &pr, combined));
 
         let result = search::search(
-            &criteria,
+            criteria,
             threads,
             attempts_ref,
             Some(feed_ref),
             &running,
-            external_entropy.as_ref(),
+            external_entropy,
+            base,
         );
         progress_running.store(false, Ordering::Relaxed);
         result
@@ -208,21 +290,100 @@ fn run_wallet(
         eprintln!("Interrupted: search cancelled");
         std::process::exit(1);
     };
-    search::verify(&result)?;
+    (result, attempts.load(Ordering::Relaxed))
+}
 
-    println!(
-        "Wallet found! Address: 0x{} ({} attempts)",
-        hex::encode(result.address),
-        attempts.load(Ordering::Relaxed)
-    );
+fn output_dir(output: &str) -> anyhow::Result<PathBuf> {
+    let path = PathBuf::from(output);
+    if path.exists() && !path.is_dir() {
+        anyhow::bail!("--output {output:?} exists and is not a directory");
+    }
+    keystore::check_output_dir(&path)?;
+    Ok(path)
+}
+
+/// Step 1 of a split-key search, on a trusted machine.
+fn run_seed(output: String) -> anyhow::Result<()> {
+    let output_path = output_dir(&output)?;
+
+    let seed = search::generate_key();
+    let address = search::address_of_key(&seed)?;
+    let public_key = search::public_key_hex(&seed)?;
 
     let passphrase = keystore::read_passphrase()?;
-    let path = keystore::save(
-        &output_path,
-        &result.address,
-        &result.private_key,
-        passphrase.as_bytes(),
-    )?;
+    let path = keystore::save(&output_path, &address, &seed, passphrase.as_bytes())?;
+
+    println!("Seed keystore saved to: {}", path.display());
+    println!("Public key: {public_key}");
+    println!("Pass this to `eth-vanity offset --public-key`; it's safe to share.");
+    println!("Use one seed per vanity address, and don't fund the seed's own address.");
+    Ok(())
+}
+
+/// Step 2 of a split-key search. Holds no private key, so this can run on
+/// a machine that isn't trusted.
+fn run_offset(
+    public_key: String,
+    prefix: String,
+    suffix: String,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    let base = search::parse_public_key(&public_key)?;
+    let (prefix, suffix) = validate_vanity_bytes(&prefix, &suffix)?;
+    let threads = default_threads(threads);
+    if threads < 1 {
+        anyhow::bail!("--threads must be at least 1");
+    }
+
+    let criteria = MatchCriteria {
+        prefix: prefix.into_bytes(),
+        suffix: suffix.into_bytes(),
+    };
+    let (result, attempts) = run_search(&criteria, threads, None, Some(&base));
+    search::verify(&result, Some(&base))?;
+
+    let address = hex::encode(result.address);
+    let offset = hex::encode(**result.scalar);
+    println!("Offset found! Address: 0x{address} ({attempts} attempts)");
+    println!("Offset: 0x{offset}");
+    println!("Then, where the seed keystore is:");
+    println!(
+        "  eth-vanity combine --seed-keystore <FILE> --offset 0x{offset} --address 0x{address}"
+    );
+    Ok(())
+}
+
+/// Step 3 of a split-key search, back on the trusted machine.
+fn run_combine(
+    seed_keystore: String,
+    offset: String,
+    address: String,
+    output: String,
+) -> anyhow::Result<()> {
+    let offset: [u8; 32] = parse_hex_fixed(&offset, 32)?
+        .try_into()
+        .expect("parse_hex_fixed returns exactly 32 bytes");
+    let address: [u8; 20] = parse_hex_fixed(&address, 20)?
+        .try_into()
+        .expect("parse_hex_fixed returns exactly 20 bytes");
+    let output_path = output_dir(&output)?;
+
+    let seed_passphrase = keystore::read_existing_passphrase("Seed keystore passphrase: ")?;
+    let seed = keystore::load(seed_keystore.as_ref(), seed_passphrase.as_bytes())?;
+
+    let key = search::combine(&seed, &offset)?;
+    let derived = search::address_of_key(&key)?;
+    if derived != address {
+        anyhow::bail!(
+            "seed + offset gives 0x{}, not 0x{}: this seed or offset doesn't belong to that address. Nothing was saved.",
+            hex::encode(derived),
+            hex::encode(address)
+        );
+    }
+    println!("Verified: this key controls 0x{}", hex::encode(address));
+
+    let passphrase = keystore::read_passphrase()?;
+    let path = keystore::save(&output_path, &address, &key, passphrase.as_bytes())?;
     println!("Keystore saved to: {}", path.display());
     Ok(())
 }

@@ -44,6 +44,25 @@ eth-vanity create2 \          # find salt for a vanity create2 contract address
   --prefix 000000             # the prefix bytes of the desired vanity address
 ```
 
+### Searching on a machine you don't trust
+
+The split-key flow keeps the private key off the machine doing the search, so the search can run on rented hardware. The search only ever sees a public key, and what it finds (an offset) is useless without your seed key.
+
+```
+# 1. On a trusted machine: make a seed keystore and print its public key
+eth-vanity seed --output ./keystore
+
+# 2. On any machine: search using only the public key
+eth-vanity offset --public-key <PUBLIC_KEY> --prefix 0000
+
+# 3. Back on the trusted machine: add the offset to the seed and save the final keystore
+eth-vanity combine --seed-keystore ./keystore/UTC--... --offset 0x... --address 0x... --output ./keystore
+```
+
+`combine` checks that the final key really controls `--address` before saving anything, so a wrong seed or a bad result from the searching machine can't leave you with the wrong key.
+
+Use a new seed for each vanity address: anyone who learns one final key and the offsets could work out the others from the same seed. Don't send funds to the seed's own address; it's only a starting point. The offset can't take funds on its own, but there's no reason to publish it.
+
 Run `--help` / `create2 --help` for the full flag list, including `--extra-entropy` (optionally mix in randomness from random.org, on top of — never instead of — local OS randomness; see `src/entropy.rs`).
 
 ## Help
@@ -57,6 +76,9 @@ Usage: eth-vanity [OPTIONS] [COMMAND]
 
 Commands:
   create2  Mine a salt so a CREATE2 deployment lands on a vanity contract address
+  seed     Split-key step 1, on a trusted machine: make a seed keypair to search from
+  offset   Split-key step 2, on any machine: search for an offset using only a public key
+  combine  Split-key step 3, on the trusted machine: add the offset to the seed and save the key
   help     Print this message or the help of the given subcommand(s)
 
 Options:

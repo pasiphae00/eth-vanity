@@ -17,6 +17,8 @@ use std::io::Write;
 use std::path::Path;
 use zeroize::Zeroizing;
 
+use crate::search::KeyBytes;
+
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
 /// log2(N) for scrypt, matching go-ethereum's StandardScryptN = 2^18 = 262144.
@@ -152,6 +154,20 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// Decrypts a keystore file back to its private key.
+pub fn load(path: &Path, passphrase: &[u8]) -> anyhow::Result<KeyBytes> {
+    let decrypted = eth_keystore::decrypt_key(path, passphrase)
+        .map(Zeroizing::new)
+        .map_err(|e| anyhow::anyhow!("decrypting keystore {path:?}: {e}"))?;
+    anyhow::ensure!(
+        decrypted.len() == KEY_LEN,
+        "keystore {path:?} does not hold a {KEY_LEN}-byte key"
+    );
+    let mut key = Box::new(Zeroizing::new([0u8; KEY_LEN]));
+    key.copy_from_slice(&decrypted);
+    Ok(key)
+}
+
 /// Checks that `dir` can hold a keystore by creating it if needed and writing
 /// a throwaway file. Run before searching, so an unusable directory fails
 /// immediately rather than after a long search whose key can't be saved.
@@ -179,6 +195,13 @@ pub fn read_passphrase() -> anyhow::Result<Zeroizing<String>> {
             Err(problem) => eprintln!("{problem}; please try again."),
         }
     }
+}
+
+/// Prompts once (without echoing input) for the passphrase of an existing
+/// keystore. It was set when that keystore was made, so unlike
+/// `read_passphrase` this applies no rules to it.
+pub fn read_existing_passphrase(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
+    Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
 }
 
 fn validate_passphrase(pw1: &str, pw2: &str) -> Result<(), String> {
@@ -221,6 +244,8 @@ mod tests {
         let decrypted = eth_keystore::decrypt_key(&path, passphrase)
             .expect("eth-keystore should decrypt what we wrote");
         assert_eq!(decrypted, private_key.to_vec());
+        assert_eq!(**load(&path, passphrase).expect("load"), private_key);
+        assert!(load(&path, b"wrong passphrase").is_err());
 
         // Wrong passphrase must not decrypt (MAC check should fail).
         assert!(eth_keystore::decrypt_key(&path, b"wrong passphrase").is_err());

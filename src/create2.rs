@@ -169,8 +169,8 @@ mod tests {
             hex32("725967456576a059bfb03e05bb4b594f603ce2617eaa298d674781e715397861");
 
         let criteria = MatchCriteria {
-            prefix: b"00".to_vec(),
-            suffix: vec![],
+            prefixes: vec![b"00".to_vec()],
+            suffixes: vec![],
         };
         let attempts = AtomicU64::new(0);
         let running = AtomicBool::new(true);

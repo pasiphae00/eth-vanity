@@ -46,20 +46,20 @@ const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 
 /// Redraws a single status line ~10x/sec until `running` is cleared. Once
 /// the hash rate has a first real reading, also prints a one-time
-/// estimated-time-to-match range (not a countdown) derived from the search
-/// space size and that rate; `combined` is the total vanity byte length (0
-/// to skip the estimate, e.g. a random account with no prefix/suffix).
+/// estimated-time-to-match range (not a countdown) derived from
+/// `expected_attempts` and that rate (1 or less skips the estimate, e.g. a
+/// random account with no prefix/suffix).
 pub fn report_progress(
     attempts: &AtomicU64,
     feed: &LiveFeed,
     running: &AtomicBool,
-    combined: usize,
+    expected_attempts: f64,
 ) {
     let start = Instant::now();
     let mut rate_window_start = start;
     let mut rate_window_attempts = 0u64;
     let mut rate = 0f64;
-    let mut estimate_printed = combined == 0;
+    let mut estimate_printed = expected_attempts <= 1.0;
 
     let mut frame = 0usize;
     let mut stderr = std::io::stderr();
@@ -75,7 +75,11 @@ pub fn report_progress(
             rate_window_start = now;
 
             if !estimate_printed && rate > 0.0 {
-                let _ = writeln!(stderr, "\r\x1b[K{}", estimate_time_to_match(combined, rate));
+                let _ = writeln!(
+                    stderr,
+                    "\r\x1b[K{}",
+                    estimate_time_to_match(expected_attempts, rate)
+                );
                 estimate_printed = true;
             }
         }
@@ -110,16 +114,15 @@ fn format_duration(d: Duration) -> String {
 }
 
 /// Computes a one-standard-deviation range for how long finding a match
-/// should take, given the search space size (16^combined candidates, each
-/// an independent 1-in-N chance) and the current hash rate. Match count
+/// should take, given the mean attempts per match (each candidate being an
+/// independent 1-in-N chance) and the current hash rate. Match count
 /// follows a geometric distribution, whose standard deviation is very close
 /// to its own mean whenever the match probability is small (as it always is
 /// here) -- so this range is naturally wide, and its low end is naturally
 /// close to "could happen immediately". That's an inherent property of
 /// these odds, not an approximation error.
-fn estimate_time_to_match(combined: usize, rate: f64) -> String {
-    let p = 1.0 / 16f64.powi(combined as i32);
-    let mean = 1.0 / p;
+fn estimate_time_to_match(mean: f64, rate: f64) -> String {
+    let p = 1.0 / mean;
     let stddev = ((1.0 - p) / (p * p)).sqrt();
 
     let low_attempts = (mean - stddev).max(0.0);

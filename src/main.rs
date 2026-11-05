@@ -11,7 +11,7 @@ mod progress;
 mod search;
 
 use clap::{Parser, Subcommand};
-use matching::{MatchCriteria, hex_decode_flexible, parse_hex_fixed, validate_vanity_bytes};
+use matching::{MatchCriteria, hex_decode_flexible, parse_criteria, parse_hex_fixed};
 use progress::LiveFeed;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,19 +21,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[command(
     name = "eth-vanity-rs",
     about = "Generates an Ethereum keypair whose public address matches a given prefix and/or suffix, then saves it as an encrypted keystore file.",
-    after_help = "Notes:\n  - --prefix and --suffix accept only hex characters (0-9, a-f, A-F) and are matched\n    case-insensitively. Each extra hex character makes a match ~16x rarer, so long\n    values can take a long time to find.\n  - If neither --prefix nor --suffix is given, a random account is generated immediately.\n  - Once a matching address is found, you'll be prompted (with confirmation) for a\n    passphrase (at least 12 characters) to encrypt the keystore -- there's no flag for this, so it never ends up\n    in shell history or process listings.\n  - This is CPU-bound work; going far past --threads = number of CPUs usually doesn't\n    help and can even slow things down.\n\nSubcommands:\n  create2   mine a salt for a vanity CREATE2 contract address instead of a wallet\n  seed, offset, combine\n            search without the private key on the searching machine (split-key flow)"
+    after_help = "Notes:\n  - --prefix and --suffix accept hex characters (0-9, a-f, A-F), matched\n    case-insensitively, and . as a wildcard for one digit. Each extra hex character\n    makes a match ~16x rarer, so long values can take a long time to find.\n  - Repeat --prefix or --suffix for alternatives: the search stops at the first address\n    fitting any prefix and any suffix. Each alternative adds to the odds of a match.\n  - If neither --prefix nor --suffix is given, a random account is generated immediately.\n  - Once a matching address is found, you'll be prompted (with confirmation) for a\n    passphrase (at least 12 characters) to encrypt the keystore -- there's no flag for this, so it never ends up\n    in shell history or process listings.\n  - This is CPU-bound work; going far past --threads = number of CPUs usually doesn't\n    help and can even slow things down.\n\nSubcommands:\n  create2   mine a salt for a vanity CREATE2 contract address instead of a wallet\n  seed, offset, combine\n            search without the private key on the searching machine (split-key flow)"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Hex bytes required at the start of the address (no "0x" needed)
-    #[arg(short = 'p', long, default_value = "")]
-    prefix: String,
+    /// Hex digits required at the start of the address (no "0x" needed); "." is a
+    /// wildcard. Repeat for alternatives
+    #[arg(short = 'p', long)]
+    prefix: Vec<String>,
 
-    /// Hex bytes required at the end of the address
-    #[arg(short = 's', long, default_value = "")]
-    suffix: String,
+    /// Hex digits required at the end of the address; "." is a wildcard. Repeat for
+    /// alternatives
+    #[arg(short = 's', long)]
+    suffix: Vec<String>,
 
     /// Directory to save the encrypted keystore file
     #[arg(short = 'o', long, default_value = ".")]
@@ -66,13 +68,15 @@ enum Commands {
         #[arg(short = 'c', long = "init-code")]
         init_code: Option<String>,
 
-        /// Hex bytes required at the start of the resulting contract address
-        #[arg(short = 'p', long, default_value = "")]
-        prefix: String,
+        /// Hex digits required at the start of the resulting contract address; "." is a
+        /// wildcard. Repeat for alternatives
+        #[arg(short = 'p', long)]
+        prefix: Vec<String>,
 
-        /// Hex bytes required at the end of the resulting contract address
-        #[arg(short = 's', long, default_value = "")]
-        suffix: String,
+        /// Hex digits required at the end of the resulting contract address; "." is a
+        /// wildcard. Repeat for alternatives
+        #[arg(short = 's', long)]
+        suffix: Vec<String>,
 
         /// Number of concurrent threads searching for a match (default: number of CPUs)
         #[arg(short = 't', long)]
@@ -96,13 +100,15 @@ enum Commands {
         #[arg(short = 'k', long = "public-key")]
         public_key: String,
 
-        /// Hex bytes required at the start of the address
-        #[arg(short = 'p', long, default_value = "")]
-        prefix: String,
+        /// Hex digits required at the start of the address; "." is a wildcard. Repeat for
+        /// alternatives
+        #[arg(short = 'p', long)]
+        prefix: Vec<String>,
 
-        /// Hex bytes required at the end of the address
-        #[arg(short = 's', long, default_value = "")]
-        suffix: String,
+        /// Hex digits required at the end of the address; "." is a wildcard. Repeat for
+        /// alternatives
+        #[arg(short = 's', long)]
+        suffix: Vec<String>,
 
         /// Number of concurrent threads searching for a match (default: number of CPUs)
         #[arg(short = 't', long)]
@@ -189,13 +195,13 @@ fn install_ctrlc_handler(running: &Arc<AtomicBool>) {
 }
 
 fn run_wallet(
-    prefix: String,
-    suffix: String,
+    prefix: Vec<String>,
+    suffix: Vec<String>,
     output: String,
     threads: Option<usize>,
     extra_entropy: bool,
 ) -> anyhow::Result<()> {
-    let (prefix, suffix) = validate_vanity_bytes(&prefix, &suffix)?;
+    let criteria = parse_criteria(&prefix, &suffix)?;
     let threads = default_threads(threads);
     if threads < 1 {
         anyhow::bail!("--threads must be at least 1");
@@ -225,10 +231,6 @@ fn run_wallet(
         None
     };
 
-    let criteria = MatchCriteria {
-        prefix: prefix.into_bytes(),
-        suffix: suffix.into_bytes(),
-    };
     let (result, attempts) = run_search(&criteria, threads, external_entropy.as_ref(), None);
     search::verify(&result, None)?;
 
@@ -264,13 +266,15 @@ fn run_search(
     let attempts = AtomicU64::new(0);
     let feed = LiveFeed::new(threads);
 
-    let combined = criteria.prefix.len() + criteria.suffix.len();
+    let expected_attempts = criteria.expected_attempts();
     let progress_running = Arc::new(AtomicBool::new(true));
     let attempts_ref = &attempts;
     let feed_ref = &feed;
     let result = std::thread::scope(|scope| {
         let pr = progress_running.clone();
-        scope.spawn(move || progress::report_progress(attempts_ref, feed_ref, &pr, combined));
+        scope.spawn(move || {
+            progress::report_progress(attempts_ref, feed_ref, &pr, expected_attempts)
+        });
 
         let result = search::search(
             criteria,
@@ -324,21 +328,17 @@ fn run_seed(output: String) -> anyhow::Result<()> {
 /// a machine that isn't trusted.
 fn run_offset(
     public_key: String,
-    prefix: String,
-    suffix: String,
+    prefix: Vec<String>,
+    suffix: Vec<String>,
     threads: Option<usize>,
 ) -> anyhow::Result<()> {
     let base = search::parse_public_key(&public_key)?;
-    let (prefix, suffix) = validate_vanity_bytes(&prefix, &suffix)?;
+    let criteria = parse_criteria(&prefix, &suffix)?;
     let threads = default_threads(threads);
     if threads < 1 {
         anyhow::bail!("--threads must be at least 1");
     }
 
-    let criteria = MatchCriteria {
-        prefix: prefix.into_bytes(),
-        suffix: suffix.into_bytes(),
-    };
     let (result, attempts) = run_search(&criteria, threads, None, Some(&base));
     search::verify(&result, Some(&base))?;
 
@@ -392,8 +392,8 @@ fn run_create2(
     deployer: String,
     init_code_hash_flag: Option<String>,
     init_code_flag: Option<String>,
-    prefix: String,
-    suffix: String,
+    prefix: Vec<String>,
+    suffix: Vec<String>,
     threads: Option<usize>,
     output: Option<String>,
 ) -> anyhow::Result<()> {
@@ -424,16 +424,12 @@ fn run_create2(
         (None, None) => anyhow::bail!("one of --init-code-hash or --init-code is required"),
     };
 
-    let (prefix, suffix) = validate_vanity_bytes(&prefix, &suffix)?;
+    let criteria = parse_criteria(&prefix, &suffix)?;
     let threads = default_threads(threads);
     if threads < 1 {
         anyhow::bail!("--threads must be at least 1");
     }
 
-    let criteria = MatchCriteria {
-        prefix: prefix.into_bytes(),
-        suffix: suffix.into_bytes(),
-    };
     print_search_info(&criteria, threads);
 
     let running = Arc::new(AtomicBool::new(true));
@@ -442,13 +438,15 @@ fn run_create2(
     let attempts = AtomicU64::new(0);
     let feed = LiveFeed::new(threads);
 
-    let combined = criteria.prefix.len() + criteria.suffix.len();
+    let expected_attempts = criteria.expected_attempts();
     let progress_running = Arc::new(AtomicBool::new(true));
     let attempts_ref = &attempts;
     let feed_ref = &feed;
     let result = std::thread::scope(|scope| {
         let pr = progress_running.clone();
-        scope.spawn(move || progress::report_progress(attempts_ref, feed_ref, &pr, combined));
+        scope.spawn(move || {
+            progress::report_progress(attempts_ref, feed_ref, &pr, expected_attempts)
+        });
 
         let result = create2::search(
             &deployer_arr,
@@ -490,31 +488,35 @@ fn run_create2(
     Ok(())
 }
 
+fn describe_masks(masks: &[Vec<u8>]) -> String {
+    masks
+        .iter()
+        .map(|mask| format!("{:?}", String::from_utf8_lossy(mask)))
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
 fn print_search_info(c: &MatchCriteria, threads: usize) {
-    let has_prefix = !c.prefix.is_empty();
-    let has_suffix = !c.suffix.is_empty();
-    match (has_prefix, has_suffix) {
-        (true, true) => eprintln!(
-            "Searching for address with prefix {:?} and suffix {:?} using {threads} threads...",
-            String::from_utf8_lossy(&c.prefix),
-            String::from_utf8_lossy(&c.suffix)
-        ),
-        (true, false) => eprintln!(
-            "Searching for address with prefix {:?} using {threads} threads...",
-            String::from_utf8_lossy(&c.prefix)
-        ),
-        (false, true) => eprintln!(
-            "Searching for address with suffix {:?} using {threads} threads...",
-            String::from_utf8_lossy(&c.suffix)
-        ),
-        (false, false) => eprintln!(
+    if c.is_empty() {
+        eprintln!(
             "No prefix/suffix specified; generating a random account using {threads} threads..."
-        ),
+        );
+        return;
     }
 
-    let combined = c.prefix.len() + c.suffix.len();
-    if combined > 0 {
-        let expected = 16f64.powi(combined as i32);
-        eprintln!("Expected search space: ~1 in {expected:.0} addresses");
+    let mut wanted = Vec::new();
+    if !c.prefixes.is_empty() {
+        wanted.push(format!("prefix {}", describe_masks(&c.prefixes)));
     }
+    if !c.suffixes.is_empty() {
+        wanted.push(format!("suffix {}", describe_masks(&c.suffixes)));
+    }
+    eprintln!(
+        "Searching for address with {} using {threads} threads...",
+        wanted.join(" and ")
+    );
+    eprintln!(
+        "Expected search space: ~1 in {:.0} addresses",
+        c.expected_attempts()
+    );
 }

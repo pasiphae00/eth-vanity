@@ -373,8 +373,8 @@ mod tests {
     fn search_end_to_end_private_key_matches_address() {
         for _ in 0..10 {
             let criteria = MatchCriteria {
-                prefix: b"a".to_vec(),
-                suffix: vec![],
+                prefixes: vec![b"a".to_vec()],
+                suffixes: vec![],
             };
             let attempts = AtomicU64::new(0);
             let running = AtomicBool::new(true);
@@ -427,8 +427,8 @@ mod tests {
 
         for _ in 0..10 {
             let criteria = MatchCriteria {
-                prefix: b"a".to_vec(),
-                suffix: vec![],
+                prefixes: vec![b"a".to_vec()],
+                suffixes: vec![],
             };
             let attempts = AtomicU64::new(0);
             let running = AtomicBool::new(true);
@@ -572,8 +572,8 @@ mod tests {
     #[test]
     fn search_end_to_end_with_external_entropy() {
         let criteria = MatchCriteria {
-            prefix: b"a".to_vec(),
-            suffix: vec![],
+            prefixes: vec![b"a".to_vec()],
+            suffixes: vec![],
         };
         let attempts = AtomicU64::new(0);
         let running = AtomicBool::new(true);

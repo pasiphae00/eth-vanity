@@ -1,6 +1,6 @@
 # eth-vanity
 
-A Rust CLI that generates an Ethereum key pair whose public address matches a "vanity" prefix and/or suffix, or (via the `create2` subcommand) mines a salt for a vanity CREATE2 contract address.
+A Rust CLI that generates an Ethereum key pair whose public address matches a "vanity" prefix and/or suffix, or (via the `create2` subcommand) mines a salt for a vanity CREATE2 contract address. The wallet search can also run from a public key alone, so the private key never has to be on the machine doing the search.
 
 ## Build
 
@@ -103,6 +103,8 @@ Notes:
 
 Subcommands:
   create2   mine a salt for a vanity CREATE2 contract address instead of a wallet
+  seed, offset, combine
+            search without the private key on the searching machine (split-key flow)
 ```
 
 ## Test
@@ -117,8 +119,12 @@ Includes cross-validation of the batched point-increment math against an indepen
 
 - **Crypto**: [`k256`](https://docs.rs/k256) (RustCrypto's pure-Rust secp256k1), not the `secp256k1` crate (libsecp256k1 C bindings) that reth uses in its hot paths. That C library's public API is deliberately opaque and doesn't expose raw point arithmetic, which is exactly what the batched point-increment search needs. `k256` exposes `ProjectivePoint` addition and a built-in `batch_normalize_vartime` (Montgomery's trick, already implemented in the `ff` crate) directly.
 - **Search algorithm (wallet mode)**: each thread walks a chain of consecutive private keys from a random starting scalar (`k0*G`, `(k0+1)*G`, ...) via cheap point addition rather than a full scalar multiplication per candidate. Points are buffered in batches and converted to affine coordinates together via one batched modular inversion, amortizing that cost across the whole batch instead of paying it per candidate.
+- **Result checking**: every wallet and offset result is re-derived by a plain scalar multiplication, separate from the batched walk, before anything is printed or saved.
+- **Split-key search**: `offset` starts each chain at the seed's public key plus a random `k0*G`, using the same walk as wallet mode. The result is a scalar to add to the seed key, and `combine` checks the sum against the found address before saving.
 - **Hashing**: [`keccak-asm`](https://docs.rs/keccak-asm) instead of `sha3` — hand-written assembly Keccak, same `Digest` trait so it's a drop-in swap.
 - **Keystore**: the standard `eth-keystore` crate hardcodes scrypt N=2^13 with no way to override it, much weaker than go-ethereum's default (N=2^18). `src/keystore.rs` reimplements the encryption directly against the same primitives (`scrypt`, `aes`, `ctr`) with N=2^18, reusing `eth-keystore`'s public struct types for the JSON schema so files stay cross-compatible with geth and other standard keystore readers.
+- **Keystore files**: created as `0600`, and new directories as `0700`, matching geth. Saving never overwrites an existing file. The output directory is tested before a search starts, and a bad passphrase re-prompts rather than exiting, so a found key isn't lost at the last step.
+- **Secrets in memory**: keys, seeds, the scrypt-derived key and passphrases are wiped with `zeroize` when dropped. This is best effort: hasher state, scrypt's internal buffers and temporary copies aren't reached, and memory isn't locked, so a live secret can still reach swap.
 - **RNG in the hot loop**: neither search loop calls the OS RNG per candidate. Wallet search draws one random starting scalar per thread, then walks forward via point addition. CREATE2 search draws one random 24-byte prefix per thread, then increments an 8-byte counter for the rest of the salt.
 - **Optional external entropy** (`--extra-entropy`, wallet mode only): local OS randomness is always drawn fresh regardless; when enabled, each thread's starting scalar is derived from `Keccak256(local || external || worker_index)` instead of local bytes directly, so a doctored or unreachable random.org can only fail to add anything, never weaken the result below local-only randomness.
 - **Release profile**: `lto = "fat"`, `codegen-units = 1`, `panic = "abort"` (see `Cargo.toml`).

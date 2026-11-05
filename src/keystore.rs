@@ -12,7 +12,9 @@ use eth_keystore::{CipherparamsJson, CryptoJson, EthKeystore, KdfType, Kdfparams
 use keccak_asm::{Digest, Keccak256};
 use rand::TryRng;
 use rand::rngs::SysRng;
+use std::io::Write;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
@@ -35,15 +37,15 @@ pub fn save(
     SysRng.try_fill_bytes(&mut salt).expect("OS RNG failed");
 
     let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P)?;
-    let mut derived_key = [0u8; KEY_LEN];
-    scrypt::scrypt(passphrase, &salt, &params, &mut derived_key)?;
+    let mut derived_key = Zeroizing::new([0u8; KEY_LEN]);
+    scrypt::scrypt(passphrase, &salt, &params, derived_key.as_mut_slice())?;
 
     let mut iv = [0u8; 16];
     SysRng.try_fill_bytes(&mut iv).expect("OS RNG failed");
 
     let mut ciphertext = private_key.to_vec();
-    let key16: [u8; 16] = derived_key[..16].try_into().unwrap();
-    let mut cipher = Aes128Ctr::new(&key16.into(), &iv.into());
+    let mut cipher = Aes128Ctr::new_from_slices(&derived_key[..16], &iv)
+        .expect("key and IV lengths are fixed by their types");
     cipher.apply_keystream(&mut ciphertext);
 
     let mut mac_hasher = Keccak256::new();
@@ -76,10 +78,37 @@ pub fn save(
     let timestamp = time_utc_filename_stamp();
     let filename = format!("UTC--{timestamp}--{}", hex::encode(address));
     let path = dir.join(&filename);
-    std::fs::create_dir_all(dir)?;
-    std::fs::write(&path, contents)?;
+    create_private_dir(dir)?;
+    write_private_file(&path, contents.as_bytes())?;
 
     Ok(path)
+}
+
+/// Creates `dir` and any missing parents, owner-only on Unix like geth's
+/// keystore directory. Directories that already exist are left as they are.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Writes a new file that only the owner can read on Unix, setting the mode
+/// at creation so there's no window where it's readable by others. Refuses
+/// to overwrite an existing file: that could destroy a key.
+fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents)
 }
 
 /// Formats the current UTC time to match geth's keystore filename
@@ -119,30 +148,20 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// Prompts for a passphrase twice (without echoing input) and confirms both
-/// entries match. Buffers are zeroed as soon as they're no longer needed.
-pub fn read_passphrase() -> anyhow::Result<Vec<u8>> {
-    let mut pw1 =
-        rpassword::prompt_password("Enter a passphrase to encrypt the wallet: ")?.into_bytes();
-    let mut pw2 = rpassword::prompt_password("Confirm passphrase: ")?.into_bytes();
+/// entries match. Buffers are wiped on drop, on every exit path.
+pub fn read_passphrase() -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let pw1 = Zeroizing::new(
+        rpassword::prompt_password("Enter a passphrase to encrypt the wallet: ")?.into_bytes(),
+    );
+    let pw2 = Zeroizing::new(rpassword::prompt_password("Confirm passphrase: ")?.into_bytes());
 
-    let result = if pw1.is_empty() {
-        Err(anyhow::anyhow!("passphrase must not be empty"))
-    } else if pw1 != pw2 {
-        Err(anyhow::anyhow!("passphrases do not match"))
-    } else {
-        Ok(pw1.clone())
-    };
-
-    zero(&mut pw1);
-    zero(&mut pw2);
-
-    result
-}
-
-fn zero(b: &mut [u8]) {
-    for byte in b.iter_mut() {
-        *byte = 0;
+    if pw1.is_empty() {
+        anyhow::bail!("passphrase must not be empty");
     }
+    if *pw1 != *pw2 {
+        anyhow::bail!("passphrases do not match");
+    }
+    Ok(pw1)
 }
 
 #[cfg(test)]
@@ -176,6 +195,34 @@ mod tests {
 
         // Wrong passphrase must not decrypt (MAC check should fail).
         assert!(eth_keystore::decrypt_key(&path, b"wrong passphrase").is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_restricts_keystore_and_new_dir_to_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("eth-vanity-rs-test-{}", uuid::Uuid::new_v4()));
+        let path = save(&dir, &[0x11u8; 20], &[0x42u8; 32], b"passphrase").expect("save");
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "keystore file mode");
+        assert_eq!(mode(&dir), 0o700, "keystore dir mode");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_private_file_refuses_to_overwrite() {
+        let dir = std::env::temp_dir().join(format!("eth-vanity-rs-test-{}", uuid::Uuid::new_v4()));
+        create_private_dir(&dir).expect("create dir");
+        let path = dir.join("key");
+
+        write_private_file(&path, b"original").expect("first write");
+        assert!(write_private_file(&path, b"replacement").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -214,18 +214,13 @@ fn run_wallet(
         attempts.load(Ordering::Relaxed)
     );
 
-    let mut passphrase = keystore::read_passphrase()?;
-    let save_result = keystore::save(
+    let passphrase = keystore::read_passphrase()?;
+    let path = keystore::save(
         &output_path,
         &result.address,
         &result.private_key,
         &passphrase,
-    );
-    for b in passphrase.iter_mut() {
-        *b = 0;
-    }
-
-    let path = save_result?;
+    )?;
     println!("Keystore saved to: {}", path.display());
     Ok(())
 }

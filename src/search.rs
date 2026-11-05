@@ -23,6 +23,7 @@ use keccak_asm::{Digest, Keccak256};
 use rand::TryRng;
 use rand::rngs::SysRng;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::entropy::EXTERNAL_ENTROPY_BYTES;
 use crate::matching::MatchCriteria;
@@ -34,7 +35,10 @@ use crate::progress::LiveFeed;
 const BATCH_SIZE: usize = 1024;
 
 pub struct SearchResult {
-    pub private_key: [u8; 32],
+    /// Boxed so the key stays at one heap address, wiped on drop. Moving an
+    /// inline array through the result channel would leave copies behind
+    /// that Zeroizing can't reach.
+    pub private_key: Box<Zeroizing<[u8; 32]>>,
     pub address: [u8; 20],
 }
 
@@ -49,15 +53,17 @@ pub struct SearchResult {
 /// local randomness alone -- only fail to add anything.
 fn random_scalar(external_entropy: Option<&[u8; EXTERNAL_ENTROPY_BYTES]>, worker: usize) -> Scalar {
     loop {
-        let mut local = [0u8; 32];
-        SysRng.try_fill_bytes(&mut local).expect("OS RNG failed");
+        let mut local = Zeroizing::new([0u8; 32]);
+        SysRng
+            .try_fill_bytes(local.as_mut_slice())
+            .expect("OS RNG failed");
 
-        let seed = match external_entropy {
+        let seed = Zeroizing::new(match external_entropy {
             Some(ext) => mix_entropy(&local, ext, worker),
-            None => local,
-        };
+            None => *local,
+        });
 
-        if let Some(scalar) = Option::from(Scalar::from_repr(seed.into())) {
+        if let Some(scalar) = Option::from(Scalar::from_repr((*seed).into())) {
             let scalar: Scalar = scalar;
             if !bool::from(Field::is_zero(&scalar)) {
                 return scalar;
@@ -82,9 +88,10 @@ fn mix_entropy(
     hasher.update(local);
     hasher.update(external);
     hasher.update((worker as u64).to_be_bytes());
-    let digest = hasher.finalize();
+    let mut digest = hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
+    digest.as_mut_slice().zeroize();
     out
 }
 
@@ -107,7 +114,7 @@ pub fn search_worker(
     worker: usize,
     external_entropy: Option<&[u8; EXTERNAL_ENTROPY_BYTES]>,
 ) -> Option<SearchResult> {
-    let k0 = random_scalar(external_entropy, worker);
+    let k0 = Zeroizing::new(random_scalar(external_entropy, worker));
     let mut cur = ProjectivePoint::mul_by_generator_vartime(&k0);
 
     let mut batch = vec![ProjectivePoint::IDENTITY; BATCH_SIZE];
@@ -151,10 +158,12 @@ pub fn search_worker(
             attempts.fetch_add((i + 1) as u64, Ordering::Relaxed);
 
             let offset = Scalar::from(total_offset);
-            let match_scalar = k0 + offset;
+            let match_scalar = Zeroizing::new(*k0 + offset);
 
-            let mut private_key = [0u8; 32];
-            private_key.copy_from_slice(&match_scalar.to_bytes());
+            let mut key_bytes = match_scalar.to_bytes();
+            let mut private_key = Box::new(Zeroizing::new([0u8; 32]));
+            private_key.copy_from_slice(&key_bytes);
+            key_bytes.as_mut_slice().zeroize();
 
             return Some(SearchResult {
                 private_key,
@@ -275,7 +284,7 @@ mod tests {
                 "address {addr_hex:?} doesn't satisfy criteria"
             );
 
-            let scalar_bytes: [u8; 32] = result.private_key;
+            let scalar_bytes: [u8; 32] = **result.private_key;
             let scalar = Scalar::from_repr(scalar_bytes.into()).expect("valid scalar");
             let derived = reference_address(scalar);
             assert_eq!(
@@ -364,7 +373,7 @@ mod tests {
         let result = search(&criteria, 4, &attempts, None, &running, Some(&external))
             .expect("search should find a match");
 
-        let scalar_bytes: [u8; 32] = result.private_key;
+        let scalar_bytes: [u8; 32] = **result.private_key;
         let scalar = Scalar::from_repr(scalar_bytes.into()).expect("valid scalar");
         let derived = reference_address(scalar);
         assert_eq!(

@@ -8,6 +8,7 @@
 //! JSON schema types for on-disk compatibility.
 
 use aes::cipher::{KeyIvInit, StreamCipher};
+use anyhow::Context;
 use eth_keystore::{CipherparamsJson, CryptoJson, EthKeystore, KdfType, KdfparamsType};
 use keccak_asm::{Digest, Keccak256};
 use rand::TryRng;
@@ -23,6 +24,10 @@ const SCRYPT_LOG_N: u8 = 18;
 const SCRYPT_R: u32 = 8;
 const SCRYPT_P: u32 = 1;
 const KEY_LEN: usize = 32;
+
+/// Scrypt only slows guessing down, so the passphrase has to carry the rest
+/// of the keystore's strength against offline cracking.
+const MIN_PASSPHRASE_CHARS: usize = 12;
 
 /// Encrypts `private_key` with `passphrase` and writes it to `dir` as a
 /// geth-compatible UTC--<timestamp>--<address> keystore file. Returns the
@@ -147,21 +152,45 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// Prompts for a passphrase twice (without echoing input) and confirms both
-/// entries match. Buffers are wiped on drop, on every exit path.
-pub fn read_passphrase() -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    let pw1 = Zeroizing::new(
-        rpassword::prompt_password("Enter a passphrase to encrypt the wallet: ")?.into_bytes(),
-    );
-    let pw2 = Zeroizing::new(rpassword::prompt_password("Confirm passphrase: ")?.into_bytes());
+/// Checks that `dir` can hold a keystore by creating it if needed and writing
+/// a throwaway file. Run before searching, so an unusable directory fails
+/// immediately rather than after a long search whose key can't be saved.
+pub fn check_output_dir(dir: &Path) -> anyhow::Result<()> {
+    create_private_dir(dir).with_context(|| format!("creating output directory {dir:?}"))?;
+    let probe = dir.join(format!(".eth-vanity-write-test-{}", uuid::Uuid::new_v4()));
+    write_private_file(&probe, b"")
+        .with_context(|| format!("writing to output directory {dir:?}"))?;
+    std::fs::remove_file(&probe)?;
+    Ok(())
+}
 
-    if pw1.is_empty() {
-        anyhow::bail!("passphrase must not be empty");
+/// Prompts for a passphrase twice (without echoing input), asking again until
+/// the entries are acceptable: by now a search has already found the key, and
+/// exiting on a typo would lose it. Buffers are wiped on drop.
+pub fn read_passphrase() -> anyhow::Result<Zeroizing<String>> {
+    loop {
+        let pw1 = Zeroizing::new(rpassword::prompt_password(
+            "Enter a passphrase to encrypt the wallet: ",
+        )?);
+        let pw2 = Zeroizing::new(rpassword::prompt_password("Confirm passphrase: ")?);
+
+        match validate_passphrase(&pw1, &pw2) {
+            Ok(()) => return Ok(pw1),
+            Err(problem) => eprintln!("{problem}; please try again."),
+        }
     }
-    if *pw1 != *pw2 {
-        anyhow::bail!("passphrases do not match");
+}
+
+fn validate_passphrase(pw1: &str, pw2: &str) -> Result<(), String> {
+    if pw1.chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(format!(
+            "Passphrase must be at least {MIN_PASSPHRASE_CHARS} characters"
+        ));
     }
-    Ok(pw1)
+    if pw1 != pw2 {
+        return Err("Passphrases do not match".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -212,6 +241,37 @@ mod tests {
         assert_eq!(mode(&dir), 0o700, "keystore dir mode");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_passphrase_enforces_length_and_match() {
+        assert!(validate_passphrase("", "").is_err());
+        assert!(validate_passphrase("elevenchars", "elevenchars").is_err());
+        assert!(validate_passphrase("twelve chars", "twelve_chars").is_err());
+        assert!(validate_passphrase("twelve chars", "twelve chars").is_ok());
+        // Length counts characters, not bytes.
+        assert!(validate_passphrase("ééééé", "ééééé").is_err());
+    }
+
+    #[test]
+    fn check_output_dir_creates_dir_and_leaves_it_empty() {
+        let dir = std::env::temp_dir().join(format!("eth-vanity-rs-test-{}", uuid::Uuid::new_v4()));
+
+        check_output_dir(&dir).expect("writable dir should pass");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_output_dir_rejects_a_file_path() {
+        let path =
+            std::env::temp_dir().join(format!("eth-vanity-rs-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"").unwrap();
+
+        assert!(check_output_dir(&path).is_err());
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

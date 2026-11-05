@@ -191,16 +191,23 @@ fn parse_legacy_hex(body: &str) -> anyhow::Result<[u8; EXTERNAL_ENTROPY_BYTES]> 
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..n])
+    match s.char_indices().nth(n) {
+        Some((end, _)) => format!("{}...", &s[..end]),
+        None => s.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_handles_multibyte_characters() {
+        assert_eq!(truncate("short", 80), "short");
+        assert_eq!(truncate("abcdef", 3), "abc...");
+        // Byte 3 falls inside the second character.
+        assert_eq!(truncate("éééé", 3), "ééé...");
+    }
 
     #[test]
     fn parse_legacy_hex_valid_and_invalid() {

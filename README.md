@@ -27,7 +27,7 @@ eth-vanity \
   --output ./keystore   # (optional) save the ouput encrypted keystore file to ./keystore
 ```
 
-If neither `--prefix` nor `--suffix` is given, a random account is generated immediately. Once a match is found, you're prompted (with confirmation) for a passphrase to encrypt the resulting keystore — there's no flag for this, so it never ends up in shell history or process listings.
+If neither `--prefix` nor `--suffix` is given, a random account is generated immediately. Once a match is found, you're prompted (with confirmation) for a passphrase (at least 12 characters) to encrypt the resulting keystore — there's no flag for this, so it never ends up in shell history or process listings.
 
 Short form:
 
@@ -74,7 +74,7 @@ Notes:
     values can take a long time to find.
   - If neither --prefix nor --suffix is given, a random account is generated immediately.
   - Once a matching address is found, you'll be prompted (with confirmation) for a
-    passphrase to encrypt the keystore -- there's no flag for this, so it never ends up
+    passphrase (at least 12 characters) to encrypt the keystore -- there's no flag for this, so it never ends up
     in shell history or process listings.
   - This is CPU-bound work; going far past --threads = number of CPUs usually doesn't
     help and can even slow things down.

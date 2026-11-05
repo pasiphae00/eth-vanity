@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[command(
     name = "eth-vanity-rs",
     about = "Generates an Ethereum keypair whose public address matches a given prefix and/or suffix, then saves it as an encrypted keystore file.",
-    after_help = "Notes:\n  - --prefix and --suffix accept only hex characters (0-9, a-f, A-F) and are matched\n    case-insensitively. Each extra hex character makes a match ~16x rarer, so long\n    values can take a long time to find.\n  - If neither --prefix nor --suffix is given, a random account is generated immediately.\n  - Once a matching address is found, you'll be prompted (with confirmation) for a\n    passphrase to encrypt the keystore -- there's no flag for this, so it never ends up\n    in shell history or process listings.\n  - This is CPU-bound work; going far past --threads = number of CPUs usually doesn't\n    help and can even slow things down.\n\nSubcommands:\n  create2   mine a salt for a vanity CREATE2 contract address instead of a wallet"
+    after_help = "Notes:\n  - --prefix and --suffix accept only hex characters (0-9, a-f, A-F) and are matched\n    case-insensitively. Each extra hex character makes a match ~16x rarer, so long\n    values can take a long time to find.\n  - If neither --prefix nor --suffix is given, a random account is generated immediately.\n  - Once a matching address is found, you'll be prompted (with confirmation) for a\n    passphrase (at least 12 characters) to encrypt the keystore -- there's no flag for this, so it never ends up\n    in shell history or process listings.\n  - This is CPU-bound work; going far past --threads = number of CPUs usually doesn't\n    help and can even slow things down.\n\nSubcommands:\n  create2   mine a salt for a vanity CREATE2 contract address instead of a wallet"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -146,6 +146,7 @@ fn run_wallet(
     if output_path.exists() && !output_path.is_dir() {
         anyhow::bail!("--output {output:?} exists and is not a directory");
     }
+    keystore::check_output_dir(&output_path)?;
 
     let external_entropy = if extra_entropy {
         let source = if entropy::using_authenticated_api() {
@@ -219,7 +220,7 @@ fn run_wallet(
         &output_path,
         &result.address,
         &result.private_key,
-        &passphrase,
+        passphrase.as_bytes(),
     )?;
     println!("Keystore saved to: {}", path.display());
     Ok(())
